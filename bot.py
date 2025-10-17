@@ -1,229 +1,152 @@
-
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    CallbackQueryHandler
-)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ---------------------- CONFIG ----------------------
+# 🧠 Replace with your Bot Token
 BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
-ADMIN_ID = 5405985282  # <-- Replace with your Telegram ID
-INR_USD_RATE = 85    # Example conversion rate
+YOUR_TELEGRAM_ID = 5405985282 # <-- Replace with your Telegram ID
 
-# ---------------------- LOGGING ----------------------
+# 💰 Simple in-memory storage (restart clears data)
+users = {}
+withdraw_requests = []
+
+# 📊 Price list by year (USD)
+PRICE_LIST = {
+    "2016–22": 11,
+    "2023": 6,
+    "2024 (1–3)": 5,
+    "2024 (4)": 4,
+    "2024 (5–6)": 1
+}
+
+# 🧰 Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------- DATA ----------------------
-users = {}  # user_id: {"balance_inr":0,"balance_usd":0,"currency":"INR"}
-group_requests = []  # {"user_id":..., "link":..., "request_id":...}
-withdraw_requests = []  # {"user_id":..., "amount":..., "method":..., "currency":..., "request_id":...}
-request_counter = 0  # unique ID for each request
-
-# ---------------------- PRICE LIST ----------------------
-PRICE_LIST_INR = {
-    "2016–2022": "11$",
-    "2023": "6$",
-    "2024 (1–3)": "5$",
-    "2024 (4)": "4$",
-    "2024 (5–6)": "1$"
-}
-
-# ---------------------- START ----------------------
+# 🟢 Start Command with professional welcome
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    users.setdefault(user_id, {"balance_inr":0,"balance_usd":0,"currency":"INR"})
-    keyboard = [
-        [InlineKeyboardButton("INR", callback_data="currency_INR"),
-         InlineKeyboardButton("USD", callback_data="currency_USD")]
-    ]
+    users.setdefault(user_id, {"balance": 0})
     await update.message.reply_text(
-        "👋 Welcome to Group Buyer Bot!\n"
-        "💬 Sell your Telegram groups and withdraw funds.\n"
-        "Select your preferred currency:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        "👋 Welcome to *Professional Group Buyer Bot*!\n\n"
+        "💬 We help you sell your Telegram groups and withdraw your earnings securely.\n\n"
+        "📌 Important:\n"
+        "- Prices are listed in USD.\n"
+        "- Withdrawals are accepted via *UPI, Binance ID, BEP20*, or *Polygon USDT*.\n\n"
+        "Commands:\n"
+        "/profile - View your profile\n"
+        "/price - View price list per group\n"
+        "/sell - Submit your Telegram group link\n"
+        "/withdraw - Request withdrawal of your balance\n\n"
+        "Please follow the instructions carefully to avoid delays."
+    , parse_mode="Markdown")
 
-# ---------------------- PROFILE ----------------------
+# 👤 Profile Command
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = users.get(user_id)
-    if not user:
-        await update.message.reply_text("ℹ️ No profile found. Send /start first.")
-        return
-    balance = user["balance_inr"] if user["currency"]=="INR" else user["balance_usd"]
-    symbol = "₹" if user["currency"]=="INR" else "$"
+    user = users.get(user_id, {"balance": 0})
     await update.message.reply_text(
-        f"👤 Profile\n🆔 ID: {user_id}\n"
-        f"💰 Balance: {symbol}{balance}\n"
-        f"💱 Currency: {user['currency']}"
-    )
+        f"👤 *Profile*\n"
+        f"🆔 ID: {user_id}\n"
+        f"💰 Balance: ${user['balance']}"
+    , parse_mode="Markdown")
 
-# ---------------------- PRICE ----------------------
+# 💰 Price Command
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "💵 Price List:\n\n"
-    for year, amount in PRICE_LIST_INR.items():
-        amount_usd = round(amount / INR_USD_RATE,2)
-        msg += f"📅 {year}: ₹{amount} / ${amount_usd}\n"
-    await update.message.reply_text(msg)
+    msg = "💵 *Price List (per group in USD)*\n\n"
+    for year, price in PRICE_LIST.items():
+        msg += f"📅 {year}: ${price}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ---------------------- CURRENCY CALLBACK ----------------------
-async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    currency = query.data.split("_")[1]
-    users.setdefault(user_id, {"balance_inr":0,"balance_usd":0,"currency":"INR"})
-    users[user_id]["currency"] = currency
-    await query.edit_message_text(f"✅ Currency set to {currency}")
-
-# ---------------------- SELL GROUP ----------------------
+# 📨 Sell Command
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📩 Send your Telegram group invite link.\n"
-        "Admin will review and credit your balance manually."
-    )
+        "📩 Please send your Telegram group *invite link* here.\n"
+        "Our team will check the group year and credit your balance accordingly."
+    , parse_mode="Markdown")
 
-# ---------------------- HANDLE GROUP LINKS ----------------------
-async def handle_group_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global request_counter
-    text = update.message.text
-    user_id = update.effective_user.id
-    if "t.me/" in text:
-        request_counter += 1
-        request_id = request_counter
-        group_requests.append({"user_id":user_id,"link":text,"request_id":request_id})
-        await update.message.reply_text("✅ Group link submitted. Admin will review.")
-    else:
-        await update.message.reply_text("❌ Invalid link. Send a valid Telegram group invite link.")
-
-# ---------------------- WITHDRAW ----------------------
+# 🏧 Withdraw Command
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🏦 Send your wallet address or payment method.\n"
-        "Admin will review and process manually."
-    )
-
-async def handle_withdraw_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global request_counter
     user_id = update.effective_user.id
-    text = update.message.text
-    user = users.get(user_id)
-    if not user:
-        await update.message.reply_text("ℹ️ Start with /start first.")
-        return
-    balance_inr = user["balance_inr"]
-    balance_usd = user["balance_usd"]
-    currency = user["currency"]
-    amount = balance_inr if currency=="INR" else balance_usd
-    if amount<=0:
+    balance = users.get(user_id, {}).get("balance", 0)
+    if balance <= 0:
         await update.message.reply_text("❌ You have no balance to withdraw.")
         return
-    request_counter += 1
-    request_id = request_counter
-    withdraw_requests.append({
-        "user_id":user_id,"amount":amount,"method":text,"currency":currency,"request_id":request_id
-    })
-    await update.message.reply_text("✅ Withdraw request submitted. Admin will review.")
+    await update.message.reply_text(
+        "🏦 Please send your withdrawal address in one of the following formats:\n"
+        "- UPI ID\n"
+        "- Binance ID\n"
+        "- BEP20 Wallet Address\n"
+        "- Polygon USDT Address\n\n"
+        "After admin approval, the requested amount will be sent."
+    )
 
-# ---------------------- ADMIN PANEL ----------------------
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+# 👑 Admin Command to view withdraws
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id != YOUR_TELEGRAM_ID:
         await update.message.reply_text("❌ You are not admin.")
         return
-
-    if not group_requests and not withdraw_requests:
-        await update.message.reply_text("ℹ️ No pending requests.")
+    if not withdraw_requests:
+        await update.message.reply_text("ℹ️ No withdraw requests pending.")
         return
-
-    msg_text = "📌 Admin Panel - Pending Requests:\n\n"
-
-    for req in group_requests:
-        buttons = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_group_{req['request_id']}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_group_{req['request_id']}")
-        ]])
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📩 Group submission\nUser ID: {req['user_id']}\nLink: {req['link']}",
-            reply_markup=buttons
-        )
-
+    msg = "📜 *Pending Withdraw Requests:*\n\n"
     for req in withdraw_requests:
-        buttons = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_withdraw_{req['request_id']}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_withdraw_{req['request_id']}")
-        ]])
+        msg += f"🆔 {req['user_id']} - ${req['amount']} - {req['method']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# ✨ Combined message handler
+async def handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    users.setdefault(user_id, {"balance": 0})
+
+    # Handle group link
+    if "t.me/" in text:
+        credit = 5  # demo credit in USD
+        users[user_id]["balance"] += credit
+        await update.message.reply_text(
+            f"✅ Group received!\n💰 Temporary ${credit} added to your balance (demo).\n"
+            "Admin will verify and adjust the final amount."
+        )
+        logger.info(f"User {user_id} submitted a group. Credit ${credit}.")
+
+    # Handle withdraw request
+    elif ("@" in text) or ("binance" in text.lower()) or len(text) > 5:
+        balance = users[user_id]["balance"]
+        if balance <= 0:
+            await update.message.reply_text("❌ You have no balance to withdraw.")
+            return
+        withdraw_requests.append({"user_id": user_id, "amount": balance, "method": text})
+        users[user_id]["balance"] = 0
+        await update.message.reply_text(
+            f"✅ Withdraw request submitted for ${balance}\n💬 Admin will pay you soon."
+        )
         await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"💸 Withdraw request\nUser ID: {req['user_id']}\nAmount: {req['currency']}{req['amount']}\nMethod: {req['method']}",
-            reply_markup=buttons
+            chat_id=YOUR_TELEGRAM_ID,
+            text=f"💸 New withdraw request\n🧑 User ID: {user_id}\n💰 Amount: ${balance}\n💳 Method: {text}"
+        )
+        logger.info(f"User {user_id} requested withdraw of ${balance}.")
+
+    # Invalid message
+    else:
+        await update.message.reply_text(
+            "❌ Invalid message. Send a valid Telegram group link or a proper withdrawal address (UPI, Binance ID, BEP20, Polygon USDT)."
         )
 
-# ---------------------- CALLBACK HANDLER ----------------------
-async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    action, type_req, req_id = data.split("_")
-    req_id = int(req_id)
-
-    if type_req=="group":
-        req = next((r for r in group_requests if r["request_id"]==req_id), None)
-        if not req: return
-        user = users[req["user_id"]]
-        if action=="approve":
-            # For demo, assign ₹500 / equivalent USD
-            amt_inr = 500
-            amt_usd = round(amt_inr/INR_USD_RATE,2)
-            user["balance_inr"] += amt_inr
-            user["balance_usd"] += amt_usd
-            await context.bot.send_message(req["user_id"], f"✅ Your group was approved. ₹{amt_inr} / ${amt_usd} added.")
-            await query.edit_message_text(f"✅ Approved group from User {req['user_id']}\nLink: {req['link']}")
-        else:
-            await context.bot.send_message(req["user_id"], "❌ Your group was rejected by admin.")
-            await query.edit_message_text(f"❌ Rejected group from User {req['user_id']}\nLink: {req['link']}")
-        group_requests.remove(req)
-
-    elif type_req=="withdraw":
-        req = next((r for r in withdraw_requests if r["request_id"]==req_id), None)
-        if not req: return
-        if action=="approve":
-            await context.bot.send_message(req["user_id"], f"✅ Withdraw request approved. Admin will pay {req['currency']}{req['amount']} manually.")
-            await query.edit_message_text(f"✅ Approved withdraw for User {req['user_id']}\nAmount: {req['currency']}{req['amount']}\nMethod: {req['method']}")
-        else:
-            await context.bot.send_message(req["user_id"], f"❌ Withdraw request rejected by admin.")
-            await query.edit_message_text(f"❌ Rejected withdraw for User {req['user_id']}\nAmount: {req['currency']}{req['amount']}\nMethod: {req['method']}")
-        withdraw_requests.remove(req)
-
-# ---------------------- MAIN ----------------------
+# 🤖 Main function
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("withdraw", withdraw))
-
-    # Admin Panel
-    app.add_handler(CommandHandler("admin_panel", admin_panel))
-
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(currency_callback, pattern="currency_.*"))
-    app.add_handler(CallbackQueryHandler(admin_callback, pattern="(approve|reject)_(group|withdraw)_.*"))
-
-    # Message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_group_link))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_request))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messages))
 
     app.run_polling()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
