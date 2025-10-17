@@ -1,121 +1,135 @@
 import logging
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# 🧠 Basic Setup
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 🧠 Replace with your Bot Token
+BOT_TOKEN = "YOUR_BOT_TOKEN"
 
-TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"  # 🪙 Replace with your bot token
-ADMIN_ID = 5405985282 # 👑 Replace with your Telegram user ID
+# 💰 Simple in-memory storage (restart clears data)
+users = {}
+withdraw_requests = []
 
-# 🧾 Dummy price list (you can change these values)
+# 📊 Price list by year
 PRICE_LIST = {
-    "0-1 year": 50,
-    "1-2 years": 100,
-    "2+ years": 200
+    "2016–2022": "11$",
+    "2023": "6$",
+    "2024 (1–3)": "5$",
+    "2024 (4)": "4$",
+    "2024 (5–6)": "1$"
 }
 
-# 🧑 User data storage (temporary in memory)
-USER_DATA = {}
+# 🧰 Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# States for ConversationHandler
-SELL = range(1)
-
-# 🏁 /start Command
+# 🟢 Start Command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in USER_DATA:
-        USER_DATA[user_id] = {"balance": 0, "groups": []}
-
-    keyboard = [
-        [InlineKeyboardButton("💵 Price", callback_data="price")],
-        [InlineKeyboardButton("👤 Profile", callback_data="profile")],
-        [InlineKeyboardButton("🪙 Sell Group", callback_data="sell")],
-        [InlineKeyboardButton("🏧 Withdraw", callback_data="withdraw")]
-    ]
+    users.setdefault(user_id, {"balance": 0})
     await update.message.reply_text(
-        "👋 Welcome to *Group Seller Bot*\n\nSell your Telegram groups and get paid fast 💰",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "👋 Welcome to Group Buyer Bot\n\n"
+        "💬 You can sell your Telegram groups and withdraw your balance here.\n\n"
+        "Commands:\n"
+        "/profile - View your profile\n"
+        "/price - View price list\n"
+        "/sell - Sell your group\n"
+        "/withdraw - Withdraw your balance"
     )
 
-# 💵 /price Command
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "💰 *Group Price List:*\n\n"
-    for k, v in PRICE_LIST.items():
-        text += f"• {k}: ₹{v}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# 👤 /profile Command
+# 👤 Profile Command
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    data = USER_DATA.get(user_id, {"balance": 0, "groups": []})
-    groups = "\n".join(data["groups"]) if data["groups"] else "No groups sold yet"
-    text = f"👤 *Your Profile*\n\n💰 Balance: ₹{data['balance']}\n📜 Groups sold:\n{groups}"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# 🪙 /sell Command
-async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📩 Send me your *group invite link* to sell.")
-    return SELL
-
-# Receive group link & calculate price
-async def receive_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    link = update.message.text.strip()
-    # 📌 For now, fixed price
-    price = PRICE_LIST["0-1 year"]
-    USER_DATA[user_id]["balance"] += price
-    USER_DATA[user_id]["groups"].append(link)
-
+    user = users.get(user_id, {"balance": 0})
     await update.message.reply_text(
-        f"✅ Your group has been submitted.\n💰 You earned ₹{price}.\n🏦 Balance updated."
+        f"👤 Profile\n"
+        f"🆔 ID: {user_id}\n"
+        f"💰 Balance: ₹{user['balance']}"
     )
 
-    # 👑 Notify admin
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"📢 New group submitted by {update.effective_user.username or user_id}\n🔗 {link}\n💰 ₹{price}"
-    )
-    return ConversationHandler.END
+# 💰 Price Command
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "💵 *Price List (per group)*\n\n"
+    for year, price in PRICE_LIST.items():
+        msg += f"📅 {year}: {price}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# 🏧 /withdraw Command
+# 📨 Sell Command
+async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📩 Please send your group **invite link** here.\n"
+        "Our team will check the group year and add balance accordingly."
+    )
+
+# 📎 When user sends link
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if "t.me/" in text:
+        # You can add verification of group year here later
+        users[user_id]["balance"] += 500  # sample credit
+        await update.message.reply_text(
+            "✅ Group received!\n"
+            "💰 Temporary ₹500 added to your balance (demo).\n"
+            "Admin will verify and adjust final amount."
+        )
+    else:
+        await update.message.reply_text("❌ Invalid link. Please send a valid Telegram group invite link.")
+
+# 🏧 Withdraw Command
 async def withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    balance = USER_DATA.get(user_id, {"balance": 0})["balance"]
-
-    if balance <= 0:
-        await update.message.reply_text("🚫 You have no balance to withdraw.")
+    user_id = update.effective_user.id
+    if users[user_id]["balance"] <= 0:
+        await update.message.reply_text("❌ You have no balance to withdraw.")
         return
-
-    await update.message.reply_text("💸 Your withdrawal request has been sent to the admin.")
-
-    # 👑 Notify admin
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"💰 Withdrawal Request from @{user.username or user_id}\nAmount: ₹{balance}"
+    await update.message.reply_text(
+        "🏦 Please send your payment method (e.g. UPI ID or Wallet Address).\n"
+        "After admin approves, amount will be sent."
     )
-    # Balance will be manually cleared after payment
-    USER_DATA[user_id]["balance"] = 0
 
-# 📌 Main Function
+# 💬 Capture withdraw request
+async def handle_withdraw_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    if "@" in text or "upi" in text or len(text) > 5:
+        amount = users[user_id]["balance"]
+        withdraw_requests.append({"user_id": user_id, "amount": amount, "method": text})
+        users[user_id]["balance"] = 0
+        await update.message.reply_text(
+            f"✅ Withdraw request submitted for ₹{amount}\n"
+            "💬 Admin will pay you soon."
+        )
+        # 👑 Notify admin
+        admin_id = YOUR_TELEGRAM_ID  # <-- Replace with your Telegram ID
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=f"💸 New withdraw request\n🧑 User ID: {user_id}\n💰 Amount: ₹{amount}\n💳 Method: {text}"
+        )
+
+# 👑 Admin view withdrawals
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    admin_id = update.effective_user.id
+    if admin_id != YOUR_TELEGRAM_ID:
+        await update.message.reply_text("❌ You are not admin.")
+        return
+    if not withdraw_requests:
+        await update.message.reply_text("ℹ️ No withdraw requests pending.")
+        return
+    msg = "📜 *Pending Withdraw Requests:*\n\n"
+    for req in withdraw_requests:
+        msg += f"🆔 {req['user_id']} - ₹{req['amount']} - {req['method']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+# 🤖 Main
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    sell_handler = ConversationHandler(
-        entry_points=[CommandHandler("sell", sell)],
-        states={SELL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_group)]},
-        fallbacks=[]
-    )
-
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(sell_handler)
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("withdraw", withdraw))
-
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_withdraw_request))
     app.run_polling()
 
 if __name__ == "__main__":
