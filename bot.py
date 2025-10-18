@@ -371,4 +371,11 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except RuntimeError:
+        # if loop already running, use this fallback
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        loop.run_forever()
+
