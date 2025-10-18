@@ -1,4 +1,4 @@
-# full_marketplace_bot.py
+# advanced_marketplace_bot_final.py
 import json
 import logging
 import re
@@ -81,11 +81,28 @@ def now():
     return datetime.datetime.utcnow().isoformat() + "Z"
 
 # ========================
-# States
+# Conversation states
 # ========================
 SELL_LINK = 1
 WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT = range(10, 13)
 ADMIN_PANEL, ADMIN_ADD_USER, ADMIN_ADD_AMOUNT, ADMIN_INSPECT_USER, ADMIN_BROADCAST, ADMIN_UPDATE_PRICE, ADMIN_UPDATE_PRICE_FINAL = range(20, 27)
+
+# ========================
+# Commands
+# ========================
+COMMANDS_USER = [
+    BotCommand("start", "Open bot"),
+    BotCommand("price", "Show prices"),
+    BotCommand("sell", "Sell group"),
+    BotCommand("withdraw", "Request withdrawal"),
+    BotCommand("cancel", "Cancel action"),
+]
+
+COMMANDS_ADMIN = [
+    BotCommand("start", "Open bot"),
+    BotCommand("admin", "Admin panel"),
+    BotCommand("cancel", "Cancel action"),
+]
 
 # ========================
 # Keyboards
@@ -96,11 +113,14 @@ def get_keyboard(is_admin=False):
             ["👥 Pending Groups", "💸 Pending Withdrawals"],
             ["➕ Add Balance", "🔍 Inspect User"],
             ["🪙 Toggle Sell On/Off", "📢 Broadcast"],
-            ["💰 Update Prices", "📊 Sales Today"],
-            ["📈 Daily Sales per User"]
+            ["💰 Update Prices", "📊 Sales Today"]
         ]
     else:
-        kb = [["💰 Prices"], ["🛍 Sell"], ["💸 Withdraw"], ["💵 Balance"]]
+        kb = [
+            ["🏠 Start", "💰 Prices"],
+            ["🛍 Sell", "💸 Withdraw"],
+            ["💵 Balance"]
+        ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 # ========================
@@ -109,9 +129,11 @@ def get_keyboard(is_admin=False):
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    await update.message.reply_text(
-        "👋 Welcome to the Group Marketplace Bot!", reply_markup=get_keyboard(uid == ADMIN_ID)
-    )
+    if uid == ADMIN_ID:
+        await context.bot.set_my_commands(COMMANDS_ADMIN)
+    else:
+        await context.bot.set_my_commands(COMMANDS_USER)
+    await update.message.reply_text("👋 Welcome to the Group Marketplace Bot!", reply_markup=get_keyboard(uid == ADMIN_ID))
 
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📊 *Current Group Prices*\n\n"
@@ -139,9 +161,6 @@ async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not SELL_ENABLED:
         await update.message.reply_text("🚫 Selling is currently disabled by Admin.")
         return ConversationHandler.END
-    if context.user_data.get("in_sell"):
-        await update.message.reply_text("❌ You are already in the sell flow. Type /cancel to stop.")
-        return ConversationHandler.END
     context.user_data["in_sell"] = True
     await update.message.reply_text("📎 Send your *Telegram group invite link* (https://t.me/+ABC)", parse_mode="Markdown")
     return SELL_LINK
@@ -152,10 +171,12 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not INVITE_RE.match(text):
         await update.message.reply_text("❌ Invalid link. Please send a correct Telegram invite link.")
         return SELL_LINK
+
     s_uid = str(uid)
     data["pending_groups"][s_uid] = {"link": text, "time": now()}
     data["users"][s_uid]["groups"].append(text)
     save_data(data)
+
     kb = [
         [
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{uid}"),
@@ -164,7 +185,6 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await context.bot.send_message(ADMIN_ID, f"🆕 New group submission:\nUser ID: {uid}\nLink: {text}", reply_markup=InlineKeyboardMarkup(kb))
     await update.message.reply_text("✅ Submitted to admin for review.")
-    context.user_data.pop("in_sell", None)
     return ConversationHandler.END
 
 async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -199,11 +219,7 @@ async def withdraw_get_address(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def withdraw_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    try:
-        amount = float(update.message.text.strip())
-    except:
-        await update.message.reply_text("❌ Invalid amount. Send numeric value.")
-        return WITHDRAW_AMOUNT
+    amount = float(update.message.text.strip())
     if amount > data["users"][uid]["balance"]:
         await update.message.reply_text("❌ Not enough balance.")
         return ConversationHandler.END
@@ -231,6 +247,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     q = update.callback_query
     await q.answer()
     data_payload = q.data
+
     # Group approval
     if data_payload.startswith("approve_group:") or data_payload.startswith("reject_group:"):
         action, uid_s = data_payload.split(":")
@@ -250,6 +267,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await q.edit_message_text("❌ Group rejected.")
         save_data(data)
         return
+
     # Withdraw approval
     if data_payload.startswith("approve_withdraw:") or data_payload.startswith("reject_withdraw:"):
         action, uid_s = data_payload.split(":")
@@ -266,110 +284,3 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await q.edit_message_text("❌ Withdrawal rejected.")
         save_data(data)
         return
-
-# ========================
-# ADMIN PANEL HANDLER
-# ========================
-async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    await update.message.reply_text("🛠 *Admin Panel*", parse_mode="Markdown", reply_markup=get_keyboard(True))
-    return ADMIN_PANEL
-
-async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "🪙 Toggle Sell On/Off":
-        global SELL_ENABLED
-        SELL_ENABLED = not SELL_ENABLED
-        await update.message.reply_text(f"✅ Sell mode set to: {'ON' if SELL_ENABLED else 'OFF'}")
-    elif text == "💰 Update Prices":
-        await update.message.reply_text("📌 Send year/category to update (e.g. 2016-22):")
-        return ADMIN_UPDATE_PRICE
-    elif text == "📊 Sales Today":
-        today = datetime.datetime.utcnow().date().isoformat()
-        total = sum(u.get("daily_sales", {}).get(today, 0) for u in data["users"].values())
-        await update.message.reply_text(f"📊 Total groups sold today: {total}")
-    elif text == "📈 Daily Sales per User":
-        today = datetime.datetime.utcnow().date().isoformat()
-        report = f"📊 *Daily Sales Report ({today})*\n\n"
-        any_sales = False
-        for uid, u in data["users"].items():
-            sold = u.get("daily_sales", {}).get(today, 0)
-            if sold > 0:
-                report += f"👤 {uid}: {sold} groups\n"
-                any_sales = True
-        if not any_sales:
-            report += "No sales today."
-        await update.message.reply_text(report, parse_mode="Markdown")
-    elif text == "➕ Add Balance":
-        await update.message.reply_text("🆔 Send user ID:")
-        return ADMIN_ADD_USER
-    elif text == "🔍 Inspect User":
-        await update.message.reply_text("🆔 Send user ID:")
-        return ADMIN_INSPECT_USER
-    elif text == "📢 Broadcast":
-        await update.message.reply_text("📩 Send message to broadcast:")
-        return ADMIN_BROADCAST
-    return ADMIN_PANEL
-
-# --- remaining admin handlers (update price, add balance, broadcast, inspect) ---
-# same as your previous handlers, unchanged
-
-# ========================
-# MAIN
-# ========================
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    # User commands
-    app.add_handler(CommandHandler("start", on_start))
-    app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("balance", cmd_balance))
-
-    # Sell flow
-    sell_conv = ConversationHandler(
-        entry_points=[CommandHandler("sell", cmd_sell_entry)],
-        states={SELL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_link)]},
-        fallbacks=[CommandHandler("cancel", universal_cancel)],
-        conversation_timeout=600,
-    )
-    app.add_handler(sell_conv)
-
-    # Withdraw flow
-    withdraw_conv = ConversationHandler(
-        entry_points=[CommandHandler("withdraw", cmd_withdraw_entry)],
-        states={
-            WITHDRAW_METHOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_choose_method)],
-            WITHDRAW_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_get_address)],
-            WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_get_amount)],
-        },
-        fallbacks=[CommandHandler("cancel", universal_cancel)],
-        conversation_timeout=600,
-    )
-    app.add_handler(withdraw_conv)
-
-    # Admin panel
-    admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_panel_entry)],
-        states={
-            ADMIN_PANEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_panel_callback)],
-            ADMIN_UPDATE_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_update_prices_amount)],
-            ADMIN_UPDATE_PRICE_FINAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_update_prices_final)],
-            ADMIN_ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_user_handler)],
-            ADMIN_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_amount_handler)],
-            ADMIN_INSPECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_inspect_handler)],
-            ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_handler)],
-        },
-        fallbacks=[CommandHandler("cancel", universal_cancel)],
-        conversation_timeout=600,
-    )
-    app.add_handler(admin_conv)
-
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(admin_callback_handler))
-
-    print("🤖 Bot is running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
