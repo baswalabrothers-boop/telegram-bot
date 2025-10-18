@@ -14,8 +14,8 @@ from telegram.ext import (
 # ========================
 # CONFIG
 # ========================
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-ADMIN_IDS = [123456789]  # Replace with your Telegram ID
+BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
+ADMIN_IDS = [5405985282]  # Replace with your Telegram ID
 
 # Conversation states
 SELL_LINK, WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT, ADMIN_ACTION = range(5)
