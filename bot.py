@@ -1,4 +1,4 @@
-    # advanced_marketplace_bot.py
+# advanced_marketplace_bot.py
 import json
 import logging
 import re
@@ -24,8 +24,8 @@ from telegram.ext import (
 # ========================
 # CONFIG - set these
 # ========================
-BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
-ADMIN_ID = 5405985282  # <-- your Telegram numeric id
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+ADMIN_ID = 123456789  # <-- your Telegram numeric id
 
 DATA_PATH = Path("data.json")
 
@@ -581,3 +581,5 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
+    main()
+   
