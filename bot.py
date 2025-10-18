@@ -17,7 +17,7 @@ import asyncio
 BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
 ADMIN_ID = 5405985282
 
-# Prices
+# Group prices
 PRICES = {
     "2016-22": 11,
     "2023": 6,
@@ -34,7 +34,7 @@ approved_sells = {}     # {user_id: [link1, link2]}
 rejected_sells = {}     # {user_id: [link1, link2]}
 users_list = set()      # track all users
 
-# STATES
+# States
 SELL_LINK, WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT, BROADCAST_MESSAGE, INSPECT_USER, ADMIN_ADD_BALANCE, ADMIN_SET_PRICE = range(8)
 
 # ========================
@@ -216,7 +216,8 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     data = query.data
-    if ":" in data:  # approve/reject or withdraw actions
+    # Approve/Reject sells or withdraws
+    if ":" in data:
         action, target_user = data.split(":")
         target_user = int(target_user)
         if action == "approve":
@@ -237,6 +238,7 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
             pending_withdrawals.pop(target_user, None)
             await context.bot.send_message(chat_id=target_user, text="❌ Withdrawal request rejected.", parse_mode="Markdown")
     else:
+        # Admin panel options
         if data == "admin_stats":
             await query.edit_message_text(get_admin_stats_text(), parse_mode="Markdown")
         elif data == "admin_broadcast":
@@ -330,7 +332,7 @@ def main():
     )
     app.add_handler(withdraw_conv)
 
-    # Broadcast Flow
+    # Broadcast
     broadcast_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message)],
         states={BROADCAST_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_message)]},
@@ -338,7 +340,7 @@ def main():
     )
     app.add_handler(broadcast_conv)
 
-    # Inspect User Flow
+    # Inspect
     inspect_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, inspect_user)],
         states={INSPECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, inspect_user)]},
