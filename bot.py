@@ -14,7 +14,7 @@ import asyncio
 # ========================
 # CONFIG
 # ========================
-BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
+BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4"
 ADMIN_ID = 5405985282
 
 # Prices
@@ -35,7 +35,7 @@ rejected_sells = {}     # {user_id: [link1, link2]}
 users_list = set()      # track all users
 
 # STATES
-SELL_LINK, WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT, BROADCAST_MESSAGE, INSPECT_USER = range(6)
+SELL_LINK, WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT, BROADCAST_MESSAGE, INSPECT_USER, ADMIN_ADD_BALANCE, ADMIN_SET_PRICE = range(8)
 
 # ========================
 # HELPERS
@@ -245,7 +245,16 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         elif data == "admin_inspect_user":
             await query.edit_message_text("👤 Send user ID to inspect:")
             return INSPECT_USER
+        elif data == "admin_add_balance":
+            await query.edit_message_text("💰 Send in format: <user_id> <amount>")
+            return ADMIN_ADD_BALANCE
+        elif data == "admin_set_prices":
+            await query.edit_message_text("💵 Send in format: <year> <price>")
+            return ADMIN_SET_PRICE
 
+# ========================
+# BROADCAST, INSPECT, ADMIN BALANCE & PRICE HANDLERS
+# ========================
 async def broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
     for uid in users_list:
@@ -263,6 +272,29 @@ async def inspect_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID.")
         return INSPECT_USER
     await update.message.reply_text(get_user_history_text(uid), parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def admin_add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = update.message.text.strip().split()
+        uid = int(args[0])
+        amount = float(args[1])
+        user_balances[uid] = user_balances.get(uid, 0) + amount
+        await update.message.reply_text(f"✅ Added ${amount} to user {uid}.")
+        await context.bot.send_message(uid, text=f"💰 Admin added ${amount} to your balance.")
+    except:
+        await update.message.reply_text("❌ Usage: <user_id> <amount>")
+    return ConversationHandler.END
+
+async def admin_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        args = update.message.text.strip().split()
+        year = " ".join(args[:-1])
+        price = float(args[-1])
+        PRICES[year] = price
+        await update.message.reply_text(f"✅ Price for {year} set to ${price}")
+    except:
+        await update.message.reply_text("❌ Usage: <year> <price>")
     return ConversationHandler.END
 
 # ========================
@@ -313,6 +345,22 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)]
     )
     app.add_handler(inspect_conv)
+
+    # Admin Add Balance
+    add_balance_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_balance)],
+        states={ADMIN_ADD_BALANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_balance)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    app.add_handler(add_balance_conv)
+
+    # Admin Set Price
+    set_price_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_price)],
+        states={ADMIN_SET_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_set_price)]},
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    app.add_handler(set_price_conv)
 
     # Admin callbacks
     app.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=".*"))
