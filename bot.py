@@ -14,7 +14,7 @@ import asyncio
 # ========================
 # CONFIG
 # ========================
-BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4"
+BOT_TOKEN = "8353615250:AAEFKh2CYKd8fiG2estmGTE_bK1IHlFdH8s"
 ADMIN_ID = 5405985282
 
 # Prices
