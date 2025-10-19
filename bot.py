@@ -24,7 +24,7 @@ from telegram.ext import (
 # ========================
 # CONFIG - set these
 # ========================
-BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuXUhxMUtw5mSlMy4"
+BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4"
 ADMIN_ID = 5405985282  # <-- your Telegram numeric id
 
 DATA_PATH = Path("data.json")
