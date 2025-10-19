@@ -24,7 +24,7 @@ from telegram.ext import (
 # ========================
 # CONFIG - set these
 # ========================
-BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4"
+BOT_TOKEN = "8075394934:AAHU9tRE9vemQIDzxRuXUhxMUtw5mSlMy4"
 ADMIN_ID = 5405985282  # <-- your Telegram numeric id
 
 DATA_PATH = Path("data.json")
@@ -163,8 +163,17 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # valid
     s_uid = str(uid)
-    data["pending_groups"][s_uid] = {"link": text, "time": now()}
+    # store pending group with ownership tracking fields
+    data["pending_groups"][s_uid] = {
+        "link": text,
+        "time": now(),
+        "seller_id": s_uid,
+        # ownership tracking:
+        "ownership_status": "none",        # none | requested | transferred | verified | failed
+        "ownership_target_id": None
+    }
     data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": []})
+    # keep original behaviour: add to user's groups list immediately (as your original code did)
     data["users"][s_uid]["groups"].append(text)
     save_data(data)
     context.user_data.pop("in_sell", None)
@@ -172,8 +181,8 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # notify admin with approve/reject
     kb = [
         [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{uid}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{uid}"),
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{s_uid}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{s_uid}"),
         ]
     ]
     await context.bot.send_message(
@@ -191,6 +200,8 @@ async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("withdraw_address", None)
     context.user_data.pop("admin_mode", None)
     context.user_data.pop("target_user", None)
+    # also clear ownership awaiting flag if present for admin (safety)
+    context.user_data.pop("awaiting_ownership_id", None)
     await update.message.reply_text("❌ Operation cancelled.")
     return ConversationHandler.END
 
@@ -274,6 +285,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     q = update.callback_query
     await q.answer()
     data_payload = q.data
+
     # group approvals
     if data_payload.startswith("approve_group:") or data_payload.startswith("reject_group:"):
         action, uid_s = data_payload.split(":")
@@ -281,24 +293,40 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         if s_uid not in data["pending_groups"]:
             await q.edit_message_text("⚠️ This submission was processed already or not found.")
             return
-        info = data["pending_groups"].pop(s_uid)
-        save_data(data)
-        if action == "approve_group":
-            # increment sales
-            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[]})
-            data["users"][s_uid]["sales"] = data["users"][s_uid].get("sales", 0) + 1
-            save_data(data)
-            try:
-                await context.bot.send_message(int(s_uid), f"✅ Your group {info['link']} has been approved by admin.")
-            except:
-                pass
-            await q.edit_message_text("✅ Group approved.")
-        else:
+        info = data["pending_groups"][s_uid]
+
+        # If admin rejects immediately
+        if action == "reject_group":
+            # remove pending, notify seller
             try:
                 await context.bot.send_message(int(s_uid), f"❌ Your group {info['link']} was rejected by admin.")
             except:
                 pass
+            # remove pending entry
+            data["pending_groups"].pop(s_uid, None)
+            save_data(data)
             await q.edit_message_text("❌ Group rejected.")
+            return
+
+        # action == approve_group:
+        # Instead of finalizing immediately, request the buyer ID from admin so we can orchestrate ownership transfer
+        # mark the pending group's status to 'approved_waiting_target' and ask admin to send buyer id
+        info["status"] = "approved_waiting_target"
+        # ensure seller_id present (should be)
+        info["seller_id"] = info.get("seller_id", s_uid)
+        info["ownership_status"] = info.get("ownership_status", "none")
+        info["ownership_target_id"] = info.get("ownership_target_id", None)
+        save_data(data)
+
+        # Ask admin to send buyer @username or numeric ID (we'll capture admin text reply in button_router)
+        await q.edit_message_text("✅ Group approved. Please send the Telegram @username or numeric ID of the buyer to which the seller should transfer ownership.")
+        # Save awaiting flag in admin's user_data so their next message is treated as the target id
+        context.user_data["awaiting_ownership_id"] = {"seller_id": s_uid}
+        # Also notify seller that admin approved and will send target soon
+        try:
+            await context.bot.send_message(int(s_uid), f"✅ Your group {info['link']} was approved by admin. Admin will send buyer ID for transfer shortly.")
+        except:
+            pass
         return
 
     # withdraw approvals
@@ -338,6 +366,70 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         # delegate to admin panel callback handler below by editing message text (button clicks)
         # we simply send a small acknowledgement so panel logic (ConversationHandler) handles the rest
         await q.edit_message_text(f"Selected: {data_payload}")
+        return
+
+    # ownership verification callbacks (admin verifying)
+    # pattern: verify_ownership:{seller_uid} or reject_ownership:{seller_uid}
+    if data_payload.startswith("verify_ownership:") or data_payload.startswith("reject_ownership:"):
+        action, s_uid = data_payload.split(":")
+        s_uid = str(s_uid)
+        if s_uid not in data["pending_groups"]:
+            await q.edit_message_text("⚠️ This ownership record was processed or not found.")
+            return
+        info = data["pending_groups"].pop(s_uid)
+        if action == "verify_ownership":
+            # finalize sale: increment sales and notify parties
+            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[]})
+            data["users"][s_uid]["sales"] = data["users"][s_uid].get("sales", 0) + 1
+            # mark ownership verified
+            info["ownership_status"] = "verified"
+            save_data(data)
+            try:
+                await context.bot.send_message(int(s_uid), f"✅ Your group {info['link']} ownership has been VERIFIED by admin. Sale completed.")
+            except:
+                pass
+            await q.edit_message_text("✅ Ownership verified and sale completed.")
+        else:
+            # reject ownership verification
+            info["ownership_status"] = "failed"
+            # keep pending so seller can retry — we place it back
+            data["pending_groups"][s_uid] = info
+            save_data(data)
+            try:
+                await context.bot.send_message(int(s_uid), f"❌ Ownership verification FAILED for {info['link']}. Please re-transfer and press the Ownership Submitted button again.")
+            except:
+                pass
+            await q.edit_message_text("❌ Ownership verification marked as failed and seller notified.")
+        return
+
+    # seller pressed ownership-submitted button (pattern: submit_ownership:{seller_uid})
+    if data_payload.startswith("submit_ownership:"):
+        action, s_uid = data_payload.split(":")
+        s_uid = str(s_uid)
+        # Ensure pending exists
+        if s_uid not in data["pending_groups"]:
+            await q.edit_message_text("⚠️ This submission was processed already or not found.")
+            return
+        info = data["pending_groups"][s_uid]
+        # validate button is pressed by the seller
+        if str(q.from_user.id) != str(s_uid):
+            await q.answer("❌ Only the seller can press this.")
+            return
+        # update ownership status
+        info["ownership_status"] = "transferred"
+        save_data(data)
+        # notify admin with verify/reject buttons
+        kb = [
+            [
+                InlineKeyboardButton("✅ Ownership Verified", callback_data=f"verify_ownership:{s_uid}"),
+                InlineKeyboardButton("❌ Ownership Failed", callback_data=f"reject_ownership:{s_uid}"),
+            ]
+        ]
+        try:
+            await context.bot.send_message(ADMIN_ID, f"👤 Seller submitted ownership transfer for {info['link']}\nTarget: {info.get('ownership_target_id')}\nPlease verify.", reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            pass
+        await q.edit_message_text("✅ Ownership submitted. Admin will verify shortly.")
         return
 
 # ------------------------
@@ -502,6 +594,39 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
 # Router for reply-keyboard (only when not in a conversation)
 # ------------------------
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # FIRST: handle admin replying with ownership target ID if we are awaiting it
+    if update.effective_user.id == ADMIN_ID and context.user_data.get("awaiting_ownership_id"):
+        # admin has been asked to send buyer ID; capture it here
+        info = context.user_data.pop("awaiting_ownership_id")
+        target_id = (update.message.text or "").strip()
+        seller_id = info.get("seller_id")
+        if not seller_id or seller_id not in data["pending_groups"]:
+            await update.message.reply_text("⚠️ Pending group not found or expired.")
+            return
+
+        # Save ownership target in pending_groups
+        pg = data["pending_groups"][seller_id]
+        pg["ownership_status"] = "requested"
+        pg["ownership_target_id"] = target_id
+        save_data(data)
+
+        # Notify seller to transfer and provide submit button
+        try:
+            await context.bot.send_message(
+                int(seller_id),
+                f"📢 Please transfer the group ownership to: {target_id}\n\n"
+                "After you transfer ownership, press the button below to notify admin.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Ownership Submitted", callback_data=f"submit_ownership:{seller_id}")]
+                ])
+            )
+        except:
+            pass
+
+        await update.message.reply_text(f"✅ Ownership target set to {target_id} and seller notified.")
+        return
+
+    # FALLBACK: original router logic for keyboard buttons
     txt = (update.message.text or "").strip()
     uid = update.effective_user.id
     ensure_user(uid)
@@ -563,8 +688,8 @@ def main():
     app.add_handler(withdraw_conv)
     app.add_handler(admin_conv)
 
-    # Callbacks: approve/reject
-    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(approve_group|reject_group|approve_withdraw|reject_withdraw):"))
+    # Callbacks: approve/reject + ownership submit + ownership verify/reject
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(approve_group|reject_group|approve_withdraw|reject_withdraw|submit_ownership|verify_ownership|reject_ownership):"))
     # Admin panel buttons (these are admin_ prefixed callbacks)
     app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
 
@@ -582,4 +707,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-   
