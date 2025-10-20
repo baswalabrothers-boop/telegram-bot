@@ -108,7 +108,7 @@ COMMANDS = [
 def get_keyboard(is_admin=False):
     kb = [
         ["🏠 Start", "💰 Prices"],
-        [""🛍 Sell", "💸 Withdraw"],
+        ["🛍 Sell", "💸 Withdraw"],
         ["💵 Balance"]
     ]
     if is_admin:
