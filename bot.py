@@ -49,21 +49,27 @@ logger = logging.getLogger(__name__)
 def load_data():
     if not DATA_PATH.exists():
         return {
-            "users": {},               # user_id -> {"balance": float, "groups": [links], "sales": int}
-            "pending_groups": {},      # user_id -> {"link":..., "time":...}
+            "users": {},               # user_id -> {"balance": float, "groups": [links], "sales": int, "custom_prices": {}}
+            "pending_groups": {},      # user_id -> {"link":..., "time":..., ...}
             "pending_withdrawals": {}, # user_id -> {"method":..., "address":..., "amount":..., "time":...}
         }
     return json.loads(DATA_PATH.read_text(encoding="utf8"))
 
-def save_data(data):
-    DATA_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf8")
+def save_data(data_obj):
+    DATA_PATH.write_text(json.dumps(data_obj, indent=2, ensure_ascii=False), encoding="utf8")
 
 data = load_data()
 
 def ensure_user(uid: int):
     s = str(uid)
     if s not in data["users"]:
-        data["users"][s] = {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": []}
+        data["users"][s] = {
+            "balance": 0.0,
+            "groups": [],
+            "sales": 0,
+            "withdraw_history": [],
+            "custom_prices": {}   # <-- added storage for per-user custom prices
+        }
         save_data(data)
 
 # ========================
@@ -121,8 +127,21 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_keyboard(uid == ADMIN_ID),
     )
 
+# Price command: show per-user custom prices first (if any), then global
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    ensure_user(uid)
+
     text = "📊 *Current Group Prices*\n\n"
+    user_custom = data["users"][str(uid)].get("custom_prices", {})
+
+    if user_custom:
+        text += "✨ *Your Custom Prices:*\n"
+        for k, v in user_custom.items():
+            text += f"📅 {k}: {v}\n"
+        text += "\n"
+
+    text += "🌍 *Standard Prices:*\n"
     for k, v in PRICES.items():
         text += f"📅 {k}: {v}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -147,13 +166,11 @@ async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type /cancel to stop. (Auto-cancels after 10 minutes.)",
         parse_mode="Markdown"
     )
-    # schedule timeout using context.job_queue would be nicer, but we can rely on conversation_timeout param.
     return SELL_LINK
 
 async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
-    # If user had canceled earlier, ensure not processing
     if not context.user_data.get("in_sell"):
         return ConversationHandler.END
 
@@ -161,24 +178,21 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid Telegram invite link. Send correct link or /cancel to stop.")
         return SELL_LINK
 
-    # valid
     s_uid = str(uid)
     # store pending group with ownership tracking fields
     data["pending_groups"][s_uid] = {
         "link": text,
         "time": now(),
         "seller_id": s_uid,
-        # ownership tracking:
         "ownership_status": "none",        # none | requested | transferred | verified | failed
-        "ownership_target_id": None
+        "ownership_target_id": None,
+        "status": "pending"               # used for admin workflow state
     }
-    data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": []})
-    # keep original behaviour: add to user's groups list immediately (as your original code did)
+    data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}})
     data["users"][s_uid]["groups"].append(text)
     save_data(data)
     context.user_data.pop("in_sell", None)
 
-    # notify admin with approve/reject
     kb = [
         [
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{s_uid}"),
@@ -194,13 +208,11 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # clear any flags in user_data to avoid ghost behavior
     context.user_data.pop("in_sell", None)
     context.user_data.pop("withdraw_method", None)
     context.user_data.pop("withdraw_address", None)
     context.user_data.pop("admin_mode", None)
     context.user_data.pop("target_user", None)
-    # also clear ownership awaiting flag if present for admin (safety)
     context.user_data.pop("awaiting_ownership_id", None)
     await update.message.reply_text("❌ Operation cancelled.")
     return ConversationHandler.END
@@ -211,7 +223,6 @@ async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    # show last 5 withdraws
     hist = data["users"][str(uid)].get("withdraw_history", [])[-5:]
     if hist:
         lines = [f"{h['time']}: {h['amount']}$ via {h['method']} — {h['status']}" for h in hist]
@@ -255,19 +266,16 @@ async def withdraw_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"⚠️ Insufficient balance. Your balance: ${bal:.2f}")
         return ConversationHandler.END
 
-    # store pending withdrawal
     data["pending_withdrawals"][str(uid)] = {
         "method": context.user_data["withdraw_method"],
         "address": context.user_data["withdraw_address"],
         "amount": amount,
         "time": now(),
     }
-    # add to user withdraw history as Pending
     rec = {"method": context.user_data["withdraw_method"], "address": context.user_data["withdraw_address"], "amount": amount, "status": "Pending", "time": now()}
     data["users"][str(uid)]["withdraw_history"].append(rec)
     save_data(data)
 
-    # notify admin with inline approve/dismiss
     kb = [
         [
             InlineKeyboardButton("✅ Approve", callback_data=f"approve_withdraw:{uid}"),
@@ -297,32 +305,24 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
         # If admin rejects immediately
         if action == "reject_group":
-            # remove pending, notify seller
             try:
                 await context.bot.send_message(int(s_uid), f"❌ Your group {info['link']} was rejected by admin.")
             except:
                 pass
-            # remove pending entry
             data["pending_groups"].pop(s_uid, None)
             save_data(data)
             await q.edit_message_text("❌ Group rejected.")
             return
 
         # action == approve_group:
-        # Instead of finalizing immediately, request the buyer ID from admin so we can orchestrate ownership transfer
-        # mark the pending group's status to 'approved_waiting_target' and ask admin to send buyer id
         info["status"] = "approved_waiting_target"
-        # ensure seller_id present (should be)
         info["seller_id"] = info.get("seller_id", s_uid)
         info["ownership_status"] = info.get("ownership_status", "none")
         info["ownership_target_id"] = info.get("ownership_target_id", None)
         save_data(data)
 
-        # Ask admin to send buyer @username or numeric ID (we'll capture admin text reply in button_router)
         await q.edit_message_text("✅ Group approved. Please send the Telegram @username or numeric ID of the buyer to which the seller should transfer ownership.")
-        # Save awaiting flag in admin's user_data so their next message is treated as the target id
         context.user_data["awaiting_ownership_id"] = {"seller_id": s_uid}
-        # Also notify seller that admin approved and will send target soon
         try:
             await context.bot.send_message(int(s_uid), f"✅ Your group {info['link']} was approved by admin. Admin will send buyer ID for transfer shortly.")
         except:
@@ -337,15 +337,13 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await q.edit_message_text("⚠️ This withdrawal was processed or not found.")
             return
         wd = data["pending_withdrawals"].pop(s_uid)
-        # update user's withdraw_history last pending -> approved/rejected
         hist = data["users"].get(s_uid, {}).get("withdraw_history", [])
         for rec in reversed(hist):
             if rec["status"] == "Pending" and rec["amount"] == wd["amount"] and rec["method"] == wd["method"]:
                 rec["status"] = "Approved" if action == "approve_withdraw" else "Rejected"
                 break
-        # if approved, deduct balance
         if action == "approve_withdraw":
-            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[]})
+            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[],"custom_prices":{}})
             data["users"][s_uid]["balance"] = max(0.0, data["users"][s_uid]["balance"] - float(wd["amount"]))
             try:
                 await context.bot.send_message(int(s_uid), f"✅ Your withdrawal of ${wd['amount']} has been approved and processed.")
@@ -363,13 +361,10 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 
     # admin-panel helper callbacks (prefix admin_)
     if data_payload.startswith("admin_"):
-        # delegate to admin panel callback handler below by editing message text (button clicks)
-        # we simply send a small acknowledgement so panel logic (ConversationHandler) handles the rest
         await q.edit_message_text(f"Selected: {data_payload}")
         return
 
     # ownership verification callbacks (admin verifying)
-    # pattern: verify_ownership:{seller_uid} or reject_ownership:{seller_uid}
     if data_payload.startswith("verify_ownership:") or data_payload.startswith("reject_ownership:"):
         action, s_uid = data_payload.split(":")
         s_uid = str(s_uid)
@@ -378,11 +373,11 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             return
         info = data["pending_groups"].pop(s_uid)
         if action == "verify_ownership":
-            # finalize sale: increment sales and notify parties
-            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[]})
+            data["users"].setdefault(s_uid, {"balance":0.0,"groups":[],"sales":0,"withdraw_history":[],"custom_prices":{}})
             data["users"][s_uid]["sales"] = data["users"][s_uid].get("sales", 0) + 1
-            # mark ownership verified
             info["ownership_status"] = "verified"
+            # Add credit to seller balance (determine price — first check custom prices then global if needed)
+            # NOTE: There's no year parsing in the provided code; if you want auto-credit based on year you must provide group-year logic.
             save_data(data)
             try:
                 await context.bot.send_message(int(s_uid), f"✅ Your group {info['link']} ownership has been VERIFIED by admin. Sale completed.")
@@ -390,9 +385,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 pass
             await q.edit_message_text("✅ Ownership verified and sale completed.")
         else:
-            # reject ownership verification
             info["ownership_status"] = "failed"
-            # keep pending so seller can retry — we place it back
             data["pending_groups"][s_uid] = info
             save_data(data)
             try:
@@ -406,19 +399,15 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     if data_payload.startswith("submit_ownership:"):
         action, s_uid = data_payload.split(":")
         s_uid = str(s_uid)
-        # Ensure pending exists
         if s_uid not in data["pending_groups"]:
             await q.edit_message_text("⚠️ This submission was processed already or not found.")
             return
         info = data["pending_groups"][s_uid]
-        # validate button is pressed by the seller
         if str(q.from_user.id) != str(s_uid):
             await q.answer("❌ Only the seller can press this.")
             return
-        # update ownership status
         info["ownership_status"] = "transferred"
         save_data(data)
-        # notify admin with verify/reject buttons
         kb = [
             [
                 InlineKeyboardButton("✅ Ownership Verified", callback_data=f"verify_ownership:{s_uid}"),
@@ -436,7 +425,6 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
 # Admin panel (Conversation)
 # ------------------------
 async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # can be triggered via /admin command or "🧑‍💻 Admin" keyboard button
     user = update.effective_user
     if user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized.")
@@ -445,6 +433,7 @@ async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Pending Groups", callback_data="admin_pending_groups")],
         [InlineKeyboardButton("💸 Pending Withdrawals", callback_data="admin_pending_withdrawals")],
         [InlineKeyboardButton("➕ Add Balance", callback_data="admin_add_balance")],
+        [InlineKeyboardButton("💰 Custom", callback_data="admin_custom")],  # <-- New "Custom" menu
         [InlineKeyboardButton("🔍 Inspect User", callback_data="admin_inspect_user")],
         [InlineKeyboardButton("🪙 Toggle Sell On/Off", callback_data="admin_toggle_sell")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
@@ -452,6 +441,7 @@ async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧑‍💻 *Admin Panel* — choose action:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     return ADMIN_PANEL
 
+# extended admin panel callback to open custom price submenu
 async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -460,7 +450,16 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return ADMIN_PANEL
     key = q.data
 
-    # Pending groups
+    if key == "admin_custom":
+        kb = [
+            [InlineKeyboardButton("➕ Set Price for User", callback_data="admin_custom_set")],
+            [InlineKeyboardButton("🧼 Remove Price for User", callback_data="admin_custom_remove")],
+            [InlineKeyboardButton("🕵️ View Price for User", callback_data="admin_custom_view")],
+        ]
+        await q.edit_message_text("💰 Custom Price — choose:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_PANEL
+
+    # handle pending groups
     if key == "admin_pending_groups":
         if not data["pending_groups"]:
             await q.edit_message_text("📭 No pending groups.")
@@ -474,7 +473,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("📋 Pending groups shown above.")
         return ADMIN_PANEL
 
-    # Pending withdrawals
+    # handle pending withdrawals
     if key == "admin_pending_withdrawals":
         if not data["pending_withdrawals"]:
             await q.edit_message_text("📭 No pending withdrawals.")
@@ -488,7 +487,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("💸 Pending withdrawals shown above.")
         return ADMIN_PANEL
 
-    # Add balance (start flow)
+    # Add balance
     if key == "admin_add_balance":
         context.user_data["admin_mode"] = "add_balance"
         await q.edit_message_text("➕ Send user ID to add balance to:")
@@ -503,7 +502,11 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     # Toggle Sell
     if key == "admin_toggle_sell":
         global SELL_ENABLED
-        SELL_ENABLED = not SELL_ENABLED
+        try:
+            SELL_ENABLED = not SELL_ENABLED
+        except NameError:
+            SELL_ENABLED = False
+            SELL_ENABLED = not SELL_ENABLED
         await q.edit_message_text(f"⚙️ Selling is now {'ENABLED' if SELL_ENABLED else 'DISABLED'}.")
         return ADMIN_PANEL
 
@@ -513,9 +516,27 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("📢 Send broadcast text to send to all users:")
         return ADMIN_BROADCAST
 
+    # Custom submenu actions
+    if key == "admin_custom_set":
+        # ask admin to send user id (we'll capture in button_router)
+        context.user_data["admin_mode"] = "custom_set_user"
+        await q.edit_message_text("👤 Send the user ID (numeric) to set custom prices for:")
+        return ADMIN_PANEL
+
+    if key == "admin_custom_remove":
+        context.user_data["admin_mode"] = "custom_remove_user"
+        await q.edit_message_text("👤 Send the user ID (numeric) to remove custom prices for:")
+        return ADMIN_PANEL
+
+    if key == "admin_custom_view":
+        context.user_data["admin_mode"] = "custom_view_user"
+        await q.edit_message_text("👤 Send the user ID (numeric) to view current custom prices for:")
+        return ADMIN_PANEL
+
     await q.edit_message_text("⚠️ Unknown admin action.")
     return ADMIN_PANEL
 
+# Keep admin add user/amount/inspect/broadcast handlers (unchanged)
 async def admin_add_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
@@ -573,6 +594,11 @@ async def admin_inspect_handler(update: Update, context: ContextTypes.DEFAULT_TY
     )
     for rec in u.get("withdraw_history", [])[-5:]:
         text += f"- {rec['time']}: {rec['amount']}$ via {rec['method']} — {rec['status']}\n"
+    # also show custom prices if present
+    if u.get("custom_prices"):
+        text += "\n💠 Custom Prices:\n"
+        for y, p in u["custom_prices"].items():
+            text += f"- {y}: {p}\n"
     await update.message.reply_text(text)
     return ADMIN_PANEL
 
@@ -592,11 +618,11 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
 
 # ------------------------
 # Router for reply-keyboard (only when not in a conversation)
+# and also handles admin custom-price text flow
 # ------------------------
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FIRST: handle admin replying with ownership target ID if we are awaiting it
     if update.effective_user.id == ADMIN_ID and context.user_data.get("awaiting_ownership_id"):
-        # admin has been asked to send buyer ID; capture it here
         info = context.user_data.pop("awaiting_ownership_id")
         target_id = (update.message.text or "").strip()
         seller_id = info.get("seller_id")
@@ -604,13 +630,11 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Pending group not found or expired.")
             return
 
-        # Save ownership target in pending_groups
         pg = data["pending_groups"][seller_id]
         pg["ownership_status"] = "requested"
         pg["ownership_target_id"] = target_id
         save_data(data)
 
-        # Notify seller to transfer and provide submit button
         try:
             await context.bot.send_message(
                 int(seller_id),
@@ -626,17 +650,111 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Ownership target set to {target_id} and seller notified.")
         return
 
+    # NEXT: handle admin custom-price flows (set/remove/view) captured through admin_mode
+    if update.effective_user.id == ADMIN_ID and context.user_data.get("admin_mode"):
+        mode = context.user_data.get("admin_mode")
+
+        # SET custom price - step 1: admin has been asked to send user id
+        if mode == "custom_set_user":
+            target_uid = (update.message.text or "").strip()
+            try:
+                tid = int(target_uid)
+            except:
+                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
+                return
+            ensure_user(tid)
+            context.user_data["target_user"] = str(tid)
+            context.user_data["admin_mode"] = "custom_set_value"
+            await update.message.reply_text("✍️ Send price like: `2016-22: 10$` or multiple separated by comma\nExample: `2016-22: 10$, 2023: 5$`")
+            return
+
+        # SET custom price - step 2: admin sends price values
+        if mode == "custom_set_value":
+            target_uid = context.user_data.get("target_user")
+            txt = (update.message.text or "").strip()
+            parts = [p.strip() for p in txt.split(",")]
+            new_prices = {}
+            for p in parts:
+                if ":" in p:
+                    yr, val = p.split(":", 1)
+                    new_prices[yr.strip()] = val.strip()
+            data["users"][target_uid]["custom_prices"] = new_prices
+            save_data(data)
+            await update.message.reply_text(f"✅ Custom prices set for user {target_uid}: {new_prices}")
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("target_user", None)
+            return
+
+        # REMOVE custom price - step 1: admin sends user id
+        if mode == "custom_remove_user":
+            target_uid = (update.message.text or "").strip()
+            try:
+                tid = int(target_uid)
+            except:
+                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
+                return
+            ensure_user(tid)
+            if not data["users"][str(tid)].get("custom_prices"):
+                await update.message.reply_text("⚠️ No custom prices found for this user.")
+                context.user_data.pop("admin_mode", None)
+                return
+            context.user_data["target_user"] = str(tid)
+            context.user_data["admin_mode"] = "custom_remove_action"
+            years = "\n".join(data["users"][str(tid)]["custom_prices"].keys())
+            await update.message.reply_text(
+                f"🧼 Custom prices for user {tid}:\n{years}\n\n"
+                "Type specific year to remove (e.g. `2023`) or type `all` to remove all custom prices."
+            )
+            return
+
+        # REMOVE custom price - step 2: admin sends action
+        if mode == "custom_remove_action":
+            target_uid = context.user_data.get("target_user")
+            year = (update.message.text or "").strip()
+            if year.lower() == "all":
+                data["users"][target_uid]["custom_prices"] = {}
+                save_data(data)
+                await update.message.reply_text(f"✅ All custom prices removed for user {target_uid}")
+            else:
+                if year in data["users"][target_uid]["custom_prices"]:
+                    del data["users"][target_uid]["custom_prices"][year]
+                    save_data(data)
+                    await update.message.reply_text(f"✅ Removed custom price for year {year} from user {target_uid}")
+                else:
+                    await update.message.reply_text(f"⚠️ No custom price found for year {year}.")
+            context.user_data.pop("admin_mode", None)
+            context.user_data.pop("target_user", None)
+            return
+
+        # VIEW custom price - admin sends user id
+        if mode == "custom_view_user":
+            target_uid = (update.message.text or "").strip()
+            try:
+                tid = int(target_uid)
+            except:
+                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
+                return
+            ensure_user(tid)
+            user_prices = data["users"][str(tid)].get("custom_prices", {})
+            if user_prices:
+                text = "🕵️ *Custom Prices for this User:*\n"
+                for k, v in user_prices.items():
+                    text += f"📅 {k}: {v}\n"
+                await update.message.reply_text(text, parse_mode="Markdown")
+            else:
+                await update.message.reply_text("⚠️ No custom prices set for this user.")
+            context.user_data.pop("admin_mode", None)
+            return
+
     # FALLBACK: original router logic for keyboard buttons
     txt = (update.message.text or "").strip()
     uid = update.effective_user.id
     ensure_user(uid)
-    # If user is inside a conversation, this handler won't get the message (ConversationHandler takes precedence).
     if txt == "🏠 Start":
         await on_start(update, context)
     elif txt == "💰 Prices":
         await cmd_price(update, context)
     elif txt == "🛍 Sell":
-        # start sell conversation - return as entry
         return await cmd_sell_entry(update, context)
     elif txt == "💸 Withdraw":
         return await cmd_withdraw_entry(update, context)
