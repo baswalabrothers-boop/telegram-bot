@@ -157,8 +157,13 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------
 sell_timeouts = {}  # user_id -> handle
 
+# ✅ Modified: Admin cannot sell
 async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if uid == ADMIN_ID:
+        await update.message.reply_text("⚠️ Admin cannot sell groups. Use user accounts to submit groups.")
+        return ConversationHandler.END
+
     ensure_user(uid)
     context.user_data["in_sell"] = True
     await update.message.reply_text(
@@ -598,7 +603,7 @@ async def admin_inspect_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if u.get("custom_prices"):
         text += "\n💠 Custom Prices:\n"
         for y, p in u["custom_prices"].items():
-            text += f"- {y}: {p}\n"
+                        text += f"- {y}: {p}\n"
     await update.message.reply_text(text)
     return ADMIN_PANEL
 
@@ -765,7 +770,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Unknown option or use buttons/commands.")
 
-# ========================
+        # ========================
 # App setup
 # ========================
 def main():
@@ -819,9 +824,10 @@ def main():
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("cancel", universal_cancel))
+    # ... add all other handlers exactly as in your script
 
     logger.info("Bot starting...")
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    main()        
