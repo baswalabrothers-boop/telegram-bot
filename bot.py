@@ -829,7 +829,8 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("target_user", None)
             return
 
-        if mode == "custom_view_user":                                                                                                                                                                                                                   target_uid = (update.message.text or "").strip()
+        if mode == "custom_view_user":
+            target_uid = (update.message.text or "").strip()
             try:
                 tid = int(target_uid)
             except:
