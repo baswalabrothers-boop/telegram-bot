@@ -25,8 +25,8 @@ from telegram.ext import (
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5405985282")) # Your Telegram numeric ID
-LINKS_CHANNEL = os.getenv("LINKS_CHANNEL", "-1003234042802")  # Your links channel ID (e.g., -100xxxxxxxxxx)
-WITHDRAW_CHANNEL = os.getenv("WITHDRAW_CHANNEL", "-1003224533856")  # Your withdrawals channel ID (e.g., -100xxxxxxxxxx)
+LINKS_CHANNEL = os.getenv("LINKS_CHANNEL", "-1003234042802") # Your links channel ID (e.g., -100xxxxxxxxxx)
+WITHDRAW_CHANNEL = os.getenv("WITHDRAW_CHANNEL", "-1003224533856") # Your withdrawals channel ID (e.g., -100xxxxxxxxxx)
 DATA_PATH = Path("data.json")
 DEFAULT_PRICES = {
     "2016-22": "11$",
@@ -51,6 +51,7 @@ def load_data():
                 "users": {}, # user_id -> {"balance": float, "groups": [links], "sales": int, "custom_prices": {}, "start_time": str}
                 "pending_groups": {}, # user_id:link -> {"link":..., "time":..., "year":..., "approved_count": int}
                 "pending_withdrawals": {}, # user_id -> {"method":..., "address":..., "amount":..., "time":...}
+                "pending_requests": {}, # message_id -> {"type": "count"|"buyer", "seller_id": str, "time": str}
                 "sell_enabled": True, # Global sell toggle
                 "global_prices": DEFAULT_PRICES # Global prices
             }
@@ -61,6 +62,7 @@ def load_data():
             "users": {},
             "pending_groups": {},
             "pending_withdrawals": {},
+            "pending_requests": {},
             "sell_enabled": True,
             "global_prices": DEFAULT_PRICES
         }
@@ -497,21 +499,24 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         save_data(data)
         # Check if submission includes folders
         is_folder_submission = any(info["type"] == "folder" for info in user_pending.values())
+        await q.edit_message_text(f"✅ {len(user_pending)} submission(s) approved.")
+        links_text = "\n".join([info["link"] for info in user_pending.values()])
         if is_folder_submission:
-            await q.edit_message_text(
-                f"✅ {len(user_pending)} link(s) approved. Since this includes folder(s), please send the total number of approved groups (counting folders' contents):"
+            sent_msg = await context.bot.send_message(
+                ADMIN_ID,
+                f"Since this includes folder(s), please reply to this message with the total number of approved groups (counting folders' contents) for user {s_uid}:\n{links_text}"
             )
-            context.user_data["awaiting_group_count"] = {"seller_id": s_uid}
+            data["pending_requests"][str(sent_msg.message_id)] = {"type": "count", "seller_id": s_uid, "time": now()}
         else:
             for key, info in user_pending.items():
                 info["approved_count"] = 1
                 info["status"] = "approved_waiting_target"
             save_data(data)
-            links_text = "\n".join([info["link"] for info in user_pending.values()])
-            await q.edit_message_text(
-                f"✅ {len(user_pending)} submission(s) approved. Please send the Telegram @username or numeric ID of the buyer for these links:\n{links_text}"
+            sent_msg = await context.bot.send_message(
+                ADMIN_ID,
+                f"Please reply to this message with the Telegram @username or numeric ID of the buyer for these links of user {s_uid}:\n{links_text}"
             )
-            context.user_data["awaiting_ownership_id"] = {"seller_id": s_uid}
+            data["pending_requests"][str(sent_msg.message_id)] = {"type": "buyer", "seller_id": s_uid, "time": now()}
             try:
                 await context.bot.send_message(
                     int(s_uid),
@@ -519,6 +524,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 )
             except:
                 logger.warning(f"Failed to notify user {s_uid} of group approval.")
+        save_data(data)
         return
     # Withdraw approvals
     if data_payload.startswith("approve_withdraw:") or data_payload.startswith("reject_withdraw:"):
@@ -840,66 +846,6 @@ async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_
 # and also handles admin custom-price text flow
 # ------------------------
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID and context.user_data.get("awaiting_group_count"):
-        info = context.user_data.pop("awaiting_group_count")
-        try:
-            count = int((update.message.text or "").strip())
-            if count <= 0:
-                raise ValueError
-        except:
-            await update.message.reply_text("❌ Invalid count. Send positive integer.")
-            context.user_data["awaiting_group_count"] = info # Restore to ask again
-            return
-        seller_id = info["seller_id"]
-        user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == seller_id and v["status"] == "approved_waiting_count"}
-        if not user_pending:
-            await update.message.reply_text("⚠️ Pending submission not found.")
-            return
-        for key, pg in user_pending.items():
-            pg["approved_count"] = count
-            pg["status"] = "approved_waiting_target"
-            data["pending_groups"][key] = pg
-        save_data(data)
-        links_text = "\n".join([info["link"] for info in user_pending.values()])
-        await update.message.reply_text(
-            f"✅ Count set to {count}. Now send the Telegram @username or numeric ID of the buyer for these links:\n{links_text}"
-        )
-        context.user_data["awaiting_ownership_id"] = {"seller_id": seller_id}
-        try:
-            await context.bot.send_message(
-                int(seller_id),
-                f"✅ Your submission(s) were approved by admin ({count} groups):\n{links_text}\nAdmin will send buyer ID for transfer shortly."
-            )
-        except:
-            logger.warning(f"Failed to notify user {seller_id} of group approval.")
-        return
-    if update.effective_user.id == ADMIN_ID and context.user_data.get("awaiting_ownership_id"):
-        info = context.user_data.pop("awaiting_ownership_id")
-        target_id = (update.message.text or "").strip()
-        seller_id = info.get("seller_id")
-        user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == seller_id and v["status"] == "approved_waiting_target"}
-        if not user_pending:
-            await update.message.reply_text("⚠️ Pending group/folder not found or expired.")
-            return
-        for key, pg in user_pending.items():
-            pg["ownership_status"] = "requested"
-            pg["ownership_target_id"] = target_id
-            data["pending_groups"][key] = pg
-        save_data(data)
-        links_text = "\n".join([info["link"] for info in user_pending.values()])
-        try:
-            await context.bot.send_message(
-                int(seller_id),
-                f"📢 Please transfer the group/folder ownership for:\n{links_text}\nTo: {target_id}\n\n"
-                "After you transfer ownership, press the button below to notify admin.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Ownership Submitted", callback_data=f"submit_ownership:{seller_id}")]
-                ])
-            )
-        except:
-            logger.warning(f"Failed to notify user {seller_id} of ownership target.")
-        await update.message.reply_text(f"✅ Ownership target set to {target_id} for {len(user_pending)} link(s) and seller notified.")
-        return
     if update.effective_user.id == ADMIN_ID and context.user_data.get("admin_mode"):
         mode = context.user_data.get("admin_mode")
         if mode == "custom_set_user":
@@ -1024,6 +970,70 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             return
+
+    # Handle pending requests (count or buyer) via reply
+    if update.message.reply_to_message:
+        reply_id = str(update.message.reply_to_message.message_id)
+        if reply_id in data.get("pending_requests", {}):
+            req = data["pending_requests"].pop(reply_id)
+            save_data(data)
+            s_uid = req["seller_id"]
+            txt = update.message.text.strip()
+            user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] in ["approved_waiting_count", "approved_waiting_target"]}
+            if not user_pending:
+                await update.message.reply_text("⚠️ Pending submission not found.")
+                return
+            links_text = "\n".join([info["link"] for info in user_pending.values()])
+            if req["type"] == "count":
+                try:
+                    count = int(txt)
+                    if count <= 0:
+                        raise ValueError
+                except:
+                    await update.message.reply_text("❌ Invalid count. Please reply again with a positive integer.")
+                    return
+                for key, info in user_pending.items():
+                    if info["status"] == "approved_waiting_count":
+                        info["approved_count"] = count
+                        info["status"] = "approved_waiting_target"
+                save_data(data)
+                await update.message.reply_text(f"✅ Count set to {count} for user {s_uid}.")
+                # Notify seller
+                try:
+                    await context.bot.send_message(
+                        int(s_uid),
+                        f"✅ Your submission(s) were approved by admin ({count} groups):\n{links_text}\nAdmin will send buyer ID for transfer shortly."
+                    )
+                except:
+                    logger.warning(f"Failed to notify user {s_uid} of group approval.")
+                # Ask for buyer ID
+                sent_msg = await context.bot.send_message(
+                    ADMIN_ID,
+                    f"Please reply to this message with the Telegram @username or numeric ID of the buyer for these links of user {s_uid}:\n{links_text}"
+                )
+                data["pending_requests"][str(sent_msg.message_id)] = {"type": "buyer", "seller_id": s_uid, "time": now()}
+                save_data(data)
+                return
+            elif req["type"] == "buyer":
+                target_id = txt
+                for key, pg in user_pending.items():
+                    if pg["status"] == "approved_waiting_target":
+                        pg["ownership_status"] = "requested"
+                        pg["ownership_target_id"] = target_id
+                save_data(data)
+                try:
+                    await context.bot.send_message(
+                        int(s_uid),
+                        f"📢 Please transfer the group/folder ownership for:\n{links_text}\nTo: {target_id}\n\nAfter you transfer ownership, press the button below to notify admin.",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("✅ Ownership Submitted", callback_data=f"submit_ownership:{s_uid}")]
+                        ])
+                    )
+                except:
+                    logger.warning(f"Failed to notify user {s_uid} of ownership target.")
+                await update.message.reply_text(f"✅ Ownership target set to {target_id} for {len(user_pending)} link(s) and seller notified.")
+                return
+
     txt = (update.message.text or "").strip()
     uid = update.effective_user.id
     ensure_user(uid)
@@ -1042,7 +1052,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif txt == "🧑‍💻 Admin" and uid == ADMIN_ID:
         return await admin_panel_entry(update, context)
     else:
-        await update.message.reply_text("⚠️ Unknown option or use buttons/commands.")
+        await update.message.reply_text("⚠️ Unknown option or use buttons/commands. If responding to a pending request, make sure to reply to the specific message.")
 # ========================
 # App setup
 # ========================
