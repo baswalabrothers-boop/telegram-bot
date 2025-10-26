@@ -25,7 +25,7 @@ from telegram.ext import (
 # CONFIG - set these
 # ========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5405985282")) # Your Telegram numeric ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5405985282"))  # Your Telegram numeric ID
 
 DATA_PATH = Path("data.json")
 
@@ -37,7 +37,7 @@ DEFAULT_PRICES = {
     "2024 (5-6)": "1$",
 }
 
-MAX_LINKS_PER_SUBMISSION = 10 # Maximum number of links allowed in one submission
+MAX_LINKS_PER_SUBMISSION = 10  # Maximum number of links allowed in one submission
 
 # ========================
 # Logging
@@ -52,11 +52,11 @@ def load_data():
     try:
         if not DATA_PATH.exists():
             return {
-                "users": {}, # user_id -> {"balance": float, "groups": [links], "sales": int, "custom_prices": {}}
-                "pending_groups": {}, # user_id:link -> {"link":..., "time":..., "year":...}
-                "pending_withdrawals": {}, # user_id -> {"method":..., "address":..., "amount":..., "time":...}
-                "sell_enabled": True, # Global sell toggle
-                "global_prices": DEFAULT_PRICES # Global prices
+                "users": {},  # user_id -> {"balance": float, "groups": [links], "sales": int, "custom_prices": {}, "start_time": str}
+                "pending_groups": {},  # user_id:link -> {"link":..., "time":..., "year":..., "approved_count": int}
+                "pending_withdrawals": {},  # user_id -> {"method":..., "address":..., "amount":..., "time":...}
+                "sell_enabled": True,  # Global sell toggle
+                "global_prices": DEFAULT_PRICES  # Global prices
             }
         return json.loads(DATA_PATH.read_text(encoding="utf8"))
     except json.JSONDecodeError:
@@ -85,7 +85,8 @@ def ensure_user(uid: int):
             "groups": [],
             "sales": 0,
             "withdraw_history": [],
-            "custom_prices": {}
+            "custom_prices": {},
+            "start_time": now()  # Record when user first interacts
         }
         save_data(data)
 
@@ -99,10 +100,10 @@ INVITE_RE = re.compile(
 
 # Basic address validation regex
 ADDRESS_VALIDATORS = {
-    "upi": r"^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$", # Example UPI format
-    "binance": r"^\d+$", # Binance UID (numeric)
-    "bep20": r"^0x[a-fA-F0-9]{40}$", # Ethereum/BEP20 address
-    "polygon": r"^0x[a-fA-F0-9]{40}$" # Polygon address (same as BEP20 for simplicity)
+    "upi": r"^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$",  # Example UPI format
+    "binance": r"^\d+$",  # Binance UID (numeric)
+    "bep20": r"^0x[a-fA-F0-9]{40}$",  # Ethereum/BEP20 address
+    "polygon": r"^0x[a-fA-F0-9]{40}$"  # Polygon address (same as BEP20 for simplicity)
 }
 
 def validate_address(method, address):
@@ -114,10 +115,18 @@ def validate_address(method, address):
 def now():
     return datetime.datetime.utcnow().isoformat() + "Z"
 
+def is_within_24_hours(timestamp: str) -> bool:
+    try:
+        dt = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        now_dt = datetime.datetime.utcnow()
+        return (now_dt - dt).total_seconds() <= 24 * 60 * 60
+    except:
+        return False
+
 # ========================
 # Conversation states
 # ========================
-SELL_LINK, SELL_YEAR = range(1, 3)
+SELL_TYPE, SELL_LINK, SELL_YEAR = range(1, 4)
 WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT = range(10, 13)
 ADMIN_PANEL, ADMIN_ADD_USER, ADMIN_ADD_AMOUNT, ADMIN_INSPECT_USER, ADMIN_BROADCAST = range(20, 25)
 
@@ -129,6 +138,7 @@ COMMANDS = [
     BotCommand("price", "Show prices"),
     BotCommand("sell", "Sell group"),
     BotCommand("withdraw", "Request withdrawal"),
+    BotCommand("stats", "Show bot statistics (admin only)"),
     BotCommand("cancel", "Cancel current action"),
     BotCommand("admin", "Open admin panel (admin only)"),
 ]
@@ -137,13 +147,18 @@ COMMANDS = [
 # Reply keyboard generator
 # ========================
 def get_keyboard(is_admin=False):
-    kb = [
-        ["🏠 Start", "💰 Prices"],
-        ["🛍 Sell", "💸 Withdraw"],
-        ["💵 Balance"]
-    ]
     if is_admin:
-        kb.append(["🧑‍💻 Admin"])
+        kb = [
+            ["🏠 Start", "💰 Prices"],
+            ["🛍 Sell", "📈 Stats"],
+            ["🧑‍💻 Admin"],
+        ]
+    else:
+        kb = [
+            ["🏠 Start", "💰 Prices"],
+            ["🛍 Sell", "💸 Withdraw"],
+            ["💵 Balance"],
+        ]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
 # ========================
@@ -152,7 +167,7 @@ def get_keyboard(is_admin=False):
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.set_my_commands(COMMANDS)
     uid = update.effective_user.id
-    ensure_user(uid)
+    ensure_user(uid)  # Ensure user is initialized with start_time
     await update.message.reply_text(
         "👋 Welcome to Group Marketplace Bot!\nUse the keyboard or commands to operate.",
         reply_markup=get_keyboard(uid == ADMIN_ID),
@@ -161,16 +176,13 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-
     text = "📊 *Current Group Prices*\n\n"
     user_custom = data["users"][str(uid)].get("custom_prices", {})
-
     if user_custom:
         text += "✨ *Your Custom Prices:*\n"
         for k, v in user_custom.items():
             text += f"📅 {k}: {v}\n"
         text += "\n"
-
     global_prices = data.get("global_prices", DEFAULT_PRICES)
     text += "🌍 *Standard Prices:*\n"
     for k, v in global_prices.items():
@@ -182,6 +194,36 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid)
     bal = data["users"][str(uid)]["balance"]
     await update.message.reply_text(f"💰 Your balance: ${bal:.2f}")
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid != ADMIN_ID:
+        await update.message.reply_text("❌ This command is for admin only.")
+        return
+    # Calculate stats
+    total_users = len(data["users"])
+    users_last_24h = sum(1 for u in data["users"].values() if is_within_24_hours(u.get("start_time", "")))
+    total_groups_sold = sum(u.get("sales", 0) for u in data["users"].values())
+    groups_sold_last_24h = 0
+    for user_id, user_data in data["users"].items():
+        for group_key, group_info in data.get("pending_groups", {}).items():
+            if (
+                group_info["seller_id"] == user_id
+                and group_info.get("status") == "approved_waiting_target"
+                and is_within_24_hours(group_info.get("time", ""))
+            ):
+                groups_sold_last_24h += group_info.get("approved_count", 1)
+    text = "📈 *Bot Statistics*\n\n"
+    text += f"👥 *Total Users*: {total_users}\n"
+    text += f"👥 *Users Joined (Last 24h)*: {users_last_24h}\n"
+    text += f"🛒 *Total Groups Sold*: {total_groups_sold}\n"
+    text += f"🛒 *Groups Sold (Last 24h)*: {groups_sold_last_24h}\n"
+    text += "\n*Detailed Breakdown*:\n"
+    for user_id, user_data in data["users"].items():
+        user_sales = user_data.get("sales", 0)
+        if user_sales > 0:
+            text += f"- User {user_id}: {user_sales} groups sold\n"
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ------------------------
 # SELL flow (Conversation)
@@ -200,7 +242,7 @@ async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🛍 Please choose the type of submission:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-    return SELL_LINK
+    return SELL_TYPE
 
 async def sell_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -299,12 +341,13 @@ async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "seller_id": s_uid,
             "ownership_status": "none",
             "ownership_target_id": None,
-            "status": "pending"
+            "status": "pending",
+            "type": context.user_data.get("sell_type", "single")
         }
-        data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}})
-        if link not in data["users"][s_uid]["groups"]: # Prevent duplicates
+        data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
+        if link not in data["users"][s_uid]["groups"]:  # Prevent duplicates
             data["users"][s_uid]["groups"].append(link)
-   
+
     save_data(data)
     context.user_data.pop("in_sell", None)
     context.user_data.pop("sell_links", None)
@@ -316,10 +359,10 @@ async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{s_uid}"),
         ]
     ]
-    links_text = "\n".join([f"- {link}" for link in links])
+    links_text = "\n".join([f"- {link} ({context.user_data.get('sell_type', 'unknown')} type)" for link in links])
     await context.bot.send_message(
         ADMIN_ID,
-        f"🆕 New submission ({context.user_data.get('sell_type', 'unknown')} type)\nUser: @{update.effective_user.username or update.effective_user.first_name} (ID: {uid})\nLinks:\n{links_text}\nYear: {year}\nTime: {now()}",
+        f"🆕 New submission\nUser: @{update.effective_user.username or update.effective_user.first_name} (ID: {uid})\nLinks:\n{links_text}\nYear: {year}\nTime: {now()}",
         reply_markup=InlineKeyboardMarkup(kb),
     )
     context.user_data.pop("sell_type", None)
@@ -344,6 +387,9 @@ async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ------------------------
 async def cmd_withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if uid == ADMIN_ID:
+        await update.message.reply_text("❌ This command is not available for admin.")
+        return ConversationHandler.END
     ensure_user(uid)
     hist = data["users"][str(uid)].get("withdraw_history", [])[-5:]
     if hist:
@@ -465,7 +511,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         save_data(data)
 
         # Check if submission includes folders
-        is_folder_submission = any('addlist/' in info["link"].lower() for info in user_pending.values())
+        is_folder_submission = any(info["type"] == "folder" for info in user_pending.values())
 
         if is_folder_submission:
             await q.edit_message_text(
@@ -475,6 +521,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         else:
             for key, info in user_pending.items():
                 info["approved_count"] = 1
+                info["status"] = "approved_waiting_target"
             save_data(data)
             links_text = "\n".join([info["link"] for info in user_pending.values()])
             await q.edit_message_text(
@@ -504,7 +551,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
                 rec["status"] = "Approved" if action == "approve_withdraw" else "Rejected"
                 break
         if action == "approve_withdraw":
-            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}})
+            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
             data["users"][s_uid]["balance"] = max(0.0, data["users"][s_uid]["balance"] - float(wd["amount"]))
             try:
                 await context.bot.send_message(int(s_uid), f"✅ Your withdrawal of ${wd['amount']} has been approved and processed.")
@@ -562,7 +609,7 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
             await q.edit_message_text("⚠️ No pending ownership records found.")
             return
         if action == "verify_ownership":
-            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}})
+            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
             custom_prices = data["users"][s_uid].get("custom_prices", {})
             global_prices = data.get("global_prices", DEFAULT_PRICES)
             total_credited = 0.0
@@ -658,7 +705,7 @@ async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{seller_id}"),
                 ],
             ]
-            links_text = "\n".join([f"- {info['link']} (Year: {info.get('year', 'N/A')})" for info in infos])
+            links_text = "\n".join([f"- {info['link']} (Year: {info.get('year', 'N/A')}, Type: {info.get('type', 'single')})" for info in infos])
             await context.bot.send_message(
                 ADMIN_ID,
                 f"👤 Seller ID: {seller_id}\nLinks:\n{links_text}\nSubmitted: {infos[0]['time']}",
@@ -1008,10 +1055,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_price(update, context)
     elif txt == "🛍 Sell":
         return await cmd_sell_entry(update, context)
-    elif txt == "💸 Withdraw":
+    elif txt == "💸 Withdraw" and uid != ADMIN_ID:
         return await cmd_withdraw_entry(update, context)
-    elif txt == "💵 Balance":
+    elif txt == "💵 Balance" and uid != ADMIN_ID:
         await cmd_balance(update, context)
+    elif txt == "📈 Stats" and uid == ADMIN_ID:
+        return await cmd_stats(update, context)
     elif txt == "🧑‍💻 Admin" and uid == ADMIN_ID:
         return await admin_panel_entry(update, context)
     else:
@@ -1025,10 +1074,8 @@ def main():
     sell_conv = ConversationHandler(
         entry_points=[CommandHandler("sell", cmd_sell_entry), MessageHandler(filters.Regex("🛍 Sell$"), cmd_sell_entry)],
         states={
-            SELL_LINK: [
-                CallbackQueryHandler(sell_choose_type, pattern="^sell_type_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_link)
-            ],
+            SELL_TYPE: [CallbackQueryHandler(sell_choose_type, pattern="^sell_type_")],
+            SELL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_link)],
             SELL_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_year)],
         },
         fallbacks=[CommandHandler("cancel", universal_cancel)],
@@ -1066,8 +1113,10 @@ def main():
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("cancel", universal_cancel))
     logger.info("Bot starting...")
     app.run_polling()
+
 if __name__ == "__main__":
     main()
