@@ -277,6 +277,7 @@ async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELL_LINK
     # Store valid links in context for the next step
     context.user_data["sell_links"] = valid_links
+    logger.info(f"User {uid} submitted valid links: {valid_links}")
     await update.message.reply_text(
         f"✅ Found {len(valid_links)} valid link(s):\n" +
         "\n".join(valid_links) +
@@ -288,6 +289,9 @@ async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
     year = (update.message.text or "").strip()
     if not context.user_data.get("in_sell"):
         return ConversationHandler.END
+    if not year:
+        await update.message.reply_text("❌ Year range cannot be empty. Please send a valid year (e.g., `2023`, `2016-22`).")
+        return SELL_YEAR
     global_prices = data.get("global_prices", DEFAULT_PRICES)
     # Validate year against global or custom prices
     if year not in global_prices and year not in data["users"][str(uid)].get("custom_prices", {}):
@@ -301,21 +305,27 @@ async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No links found. Please start over with /sell.")
         return ConversationHandler.END
     # Store each link as a pending group/folder
-    for link in links:
-        data["pending_groups"][f"{s_uid}:{link}"] = {
-            "link": link,
-            "year": year,
-            "time": now(),
-            "seller_id": s_uid,
-            "ownership_status": "none",
-            "ownership_target_id": None,
-            "status": "pending",
-            "type": context.user_data.get("sell_type", "single")
-        }
-        data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
-        if link not in data["users"][s_uid]["groups"]: # Prevent duplicates
-            data["users"][s_uid]["groups"].append(link)
-    save_data(data)
+    try:
+        for link in links:
+            data["pending_groups"][f"{s_uid}:{link}"] = {
+                "link": link,
+                "year": year,
+                "time": now(),
+                "seller_id": s_uid,
+                "ownership_status": "none",
+                "ownership_target_id": None,
+                "status": "pending",
+                "type": context.user_data.get("sell_type", "single")
+            }
+            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
+            if link not in data["users"][s_uid]["groups"]: # Prevent duplicates
+                data["users"][s_uid]["groups"].append(link)
+        save_data(data)
+        logger.info(f"User {uid} submitted year {year} for links: {links}")
+    except Exception as e:
+        logger.error(f"Failed to save pending groups for user {uid}: {e}")
+        await update.message.reply_text("❌ An error occurred while processing your submission. Please try again or contact admin.")
+        return ConversationHandler.END
     context.user_data.pop("in_sell", None)
     context.user_data.pop("sell_links", None)
     # Notify admin with all links
@@ -325,20 +335,23 @@ async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{s_uid}"),
         ]
     ]
+    links_text = "\n".join(links)
     text = f"🆕 New submission\nUser: @{update.effective_user.username or update.effective_user.first_name} (ID: {uid})\nLinks:\n{links_text}\nYear: {year}\nTime: {now()}"
-    await context.bot.send_message(
-        ADMIN_ID,
-        text,
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-    # Forward to links channel without buttons
     try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            text,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        # Forward to links channel without buttons
         await context.bot.send_message(
             LINKS_CHANNEL,
             text,
         )
     except Exception as e:
-        logger.error(f"Failed to forward to links channel: {e}")
+        logger.error(f"Failed to notify admin or forward to links channel for user {uid}: {e}")
+        await update.message.reply_text("❌ Failed to notify admin. Please try again later or contact support.")
+        return ConversationHandler.END
     context.user_data.pop("sell_type", None)
     await update.message.reply_text(f"✅ {len(links)} link(s) submitted to admin for review. You will be notified on approval/rejection.")
     return ConversationHandler.END
