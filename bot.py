@@ -4,6 +4,7 @@ import re
 import datetime
 import os
 from pathlib import Path
+from collections import defaultdict
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -20,14 +21,22 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
 # ========================
-# CONFIG - set these
+# CONFIG - MUST SET IN ENV
 # ========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5405985282")) # Your Telegram numeric ID
-LINKS_CHANNEL = os.getenv("LINKS_CHANNEL", "-1003234042802") # Your links channel ID (e.g., -100xxxxxxxxxx)
-WITHDRAW_CHANNEL = os.getenv("WITHDRAW_CHANNEL", "-1003224533856") # Your withdrawals channel ID (e.g., -100xxxxxxxxxx)
+BOT_TOKEN = os.getenv("8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is required!")
+
+OWNER_ID = int(os.getenv("5405985282", "0"))
+if OWNER_ID == 0:
+    raise ValueError("Set OWNER_ID in environment!")
+
+LINKS_CHANNEL = os.getenv("LINKS_CHANNEL", "-1003234042802")
+WITHDRAW_CHANNEL = os.getenv("WITHDRAW_CHANNEL", "-1003224533856")
 DATA_PATH = Path("data.json")
+
 DEFAULT_PRICES = {
     "2016-22": "11$",
     "2023": "6$",
@@ -35,43 +44,59 @@ DEFAULT_PRICES = {
     "2024 (4)": "4$",
     "2024 (5-6)": "1$",
 }
-MAX_LINKS_PER_SUBMISSION = 10 # Maximum number of links allowed in one submission
+MAX_LINKS_PER_SUBMISSION = 10
+
 # ========================
 # Logging
 # ========================
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
 # ========================
-# Persistence helpers
+# Data & Admin System
 # ========================
 def load_data():
     try:
         if not DATA_PATH.exists():
             return {
-                "users": {}, # user_id -> {"balance": float, "groups": [links], "sales": int, "custom_prices": {}, "start_time": str}
-                "pending_groups": {}, # user_id:link -> {"link":..., "time":..., "year":..., "approved_count": int}
-                "pending_withdrawals": {}, # user_id -> {"method":..., "address":..., "amount":..., "time":...}
-                "pending_requests": {}, # message_id -> {"type": "count"|"buyer", "seller_id": str, "time": str}
-                "sell_enabled": True, # Global sell toggle
-                "global_prices": DEFAULT_PRICES # Global prices
+                "users": {},
+                "pending_groups": {},
+                "pending_withdrawals": {},
+                "pending_requests": {},
+                "sell_enabled": True,
+                "global_prices": DEFAULT_PRICES,
+                "admins": [OWNER_ID],
+                "completed_sales": {}
             }
         return json.loads(DATA_PATH.read_text(encoding="utf8"))
-    except json.JSONDecodeError:
-        logger.error("Corrupted data.json. Initializing new data structure.")
+    except Exception as e:
+        logger.error(f"Corrupted data.json: {e}")
         return {
-            "users": {},
-            "pending_groups": {},
-            "pending_withdrawals": {},
-            "pending_requests": {},
-            "sell_enabled": True,
-            "global_prices": DEFAULT_PRICES
+            "users": {}, "pending_groups": {}, "pending_withdrawals": {}, "pending_requests": {},
+            "sell_enabled": True, "global_prices": DEFAULT_PRICES, "admins": [OWNER_ID], "completed_sales": {}
         }
+
 def save_data(data_obj):
     try:
         DATA_PATH.write_text(json.dumps(data_obj, indent=2, ensure_ascii=False), encoding="utf8")
     except Exception as e:
-        logger.error(f"Failed to save data.json: {e}")
+        logger.error(f"Save failed: {e}")
+
 data = load_data()
+ADMIN_IDS = set(data.get("admins", [OWNER_ID]))
+if OWNER_ID not in ADMIN_IDS:
+    ADMIN_IDS.add(OWNER_ID)
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
+def save_admins():
+    data["admins"] = list(ADMIN_IDS)
+    save_data(data)
+
 def ensure_user(uid: int):
     s = str(uid)
     if s not in data["users"]:
@@ -81,1028 +106,787 @@ def ensure_user(uid: int):
             "sales": 0,
             "withdraw_history": [],
             "custom_prices": {},
-            "start_time": now() # Record when user first interacts
+            "start_time": now(),
+            "completed_sales": []
         }
         save_data(data)
+
 # ========================
-# Regex / utilities
+# Utils
 # ========================
 INVITE_RE = re.compile(
     r"^(https?://)?(t\.me/joinchat/|t\.me/\+|telegram\.me/joinchat/|telegram\.me/\+|t\.me/|t\.me/addlist/)[A-Za-z0-9_-]+$",
     flags=re.IGNORECASE,
 )
-# Basic address validation regex
+
 ADDRESS_VALIDATORS = {
-    "upi": r"^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$", # Example UPI format
-    "binance": r"^\d+$", # Binance UID (numeric)
-    "bep20": r"^0x[a-fA-F0-9]{40}$", # Ethereum/BEP20 address
-    "polygon": r"^0x[a-fA-F0-9]{40}$" # Polygon address (same as BEP20 for simplicity)
+    "upi": r"^[a-zA-Z0-9.\-_]{2,256}@[a-zA-Z]{2,64}$",
+    "binance": r"^\d+$",
+    "bep20": r"^0x[a-fA-F0-9]{40}$",
+    "polygon": r"^0x[a-fA-F0-9]{40}$"
 }
+
 def validate_address(method, address):
     regex = ADDRESS_VALIDATORS.get(method)
-    if regex and not re.match(regex, address, re.IGNORECASE):
-        return False
-    return True
+    return regex and bool(re.match(regex, address, re.IGNORECASE))
+
 def now():
     return datetime.datetime.utcnow().isoformat() + "Z"
+
 def is_within_24_hours(timestamp: str) -> bool:
     try:
         dt = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        now_dt = datetime.datetime.utcnow()
-        return (now_dt - dt).total_seconds() <= 24 * 60 * 60
+        return (datetime.datetime.utcnow() - dt).total_seconds() <= 86400
     except:
         return False
+
 # ========================
-# Conversation states
+# States
 # ========================
 SELL_TYPE, SELL_LINK, SELL_YEAR = range(1, 4)
 WITHDRAW_METHOD, WITHDRAW_ADDRESS, WITHDRAW_AMOUNT = range(10, 13)
 ADMIN_PANEL, ADMIN_ADD_USER, ADMIN_ADD_AMOUNT, ADMIN_INSPECT_USER, ADMIN_BROADCAST = range(20, 25)
+
 # ========================
-# Commands menu (Telegram suggestions)
+# Keyboard & Commands
 # ========================
 COMMANDS = [
     BotCommand("start", "Open bot"),
     BotCommand("price", "Show prices"),
     BotCommand("sell", "Sell group"),
     BotCommand("withdraw", "Request withdrawal"),
-    BotCommand("stats", "Show bot statistics (admin only)"),
-    BotCommand("cancel", "Cancel current action"),
-    BotCommand("admin", "Open admin panel (admin only)"),
+    BotCommand("balance", "Check balance"),
+    BotCommand("stats", "Bot stats (admin)"),
+    BotCommand("admin", "Admin panel"),
+    BotCommand("cancel", "Cancel"),
 ]
-# ========================
-# Reply keyboard generator
-# ========================
-def get_keyboard(is_admin=False):
-    if is_admin:
-        kb = [
-            ["🏠 Start", "💰 Prices"],
-            ["🛍 Sell", "📈 Stats"],
-            ["🧑‍💻 Admin"],
-        ]
+
+def get_keyboard(uid: int):
+    if is_admin(uid):
+        kb = [["Start", "Prices"], ["Sell", "Stats"], ["Admin"]]
     else:
-        kb = [
-            ["🏠 Start", "💰 Prices"],
-            ["🛍 Sell", "💸 Withdraw"],
-            ["💵 Balance"],
-        ]
+        kb = [["Start", "Prices"], ["Sell", "Withdraw"], ["Balance"]]
     return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
 # ========================
-# Handlers
+# Basic Commands
 # ========================
 async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.set_my_commands(COMMANDS)
     uid = update.effective_user.id
-    ensure_user(uid) # Ensure user is initialized with start_time
+    ensure_user(uid)
+    await context.bot.set_my_commands(COMMANDS if is_admin(uid) else COMMANDS[:5])
     await update.message.reply_text(
-        "👋 Welcome to Group Marketplace Bot!\nUse the keyboard or commands to operate.",
-        reply_markup=get_keyboard(uid == ADMIN_ID),
+        "Welcome to Group Marketplace Bot!\nUse buttons below.",
+        reply_markup=get_keyboard(uid)
     )
+
 async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
-    text = "📊 *Current Group Prices*\n\n"
-    user_custom = data["users"][str(uid)].get("custom_prices", {})
-    if user_custom:
-        text += "✨ *Your Custom Prices:*\n"
-        for k, v in user_custom.items():
-            text += f"📅 {k}: {v}\n"
+    text = "*Current Prices*\n\n"
+    custom = data["users"][str(uid)].get("custom_prices", {})
+    if custom:
+        text += "*Your Custom Prices:*\n"
+        for k, v in custom.items():
+            text += f"• {k}: {v}\n"
         text += "\n"
-    global_prices = data.get("global_prices", DEFAULT_PRICES)
-    text += "🌍 *Standard Prices:*\n"
-    for k, v in global_prices.items():
-        text += f"📅 {k}: {v}\n"
+    text += "*Global Prices:*\n"
+    for k, v in data.get("global_prices", DEFAULT_PRICES).items():
+        text += f"• {k}: {v}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
+
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ensure_user(uid)
     bal = data["users"][str(uid)]["balance"]
-    await update.message.reply_text(f"💰 Your balance: ${bal:.2f}")
+    await update.message.reply_text(f"Your balance: ${bal:.2f}")
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid != ADMIN_ID:
-        await update.message.reply_text("❌ This command is for admin only.")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin only.")
         return
-    # Calculate stats
     total_users = len(data["users"])
-    users_last_24h = sum(1 for u in data["users"].values() if is_within_24_hours(u.get("start_time", "")))
-    total_groups_sold = sum(u.get("sales", 0) for u in data["users"].values())
-    groups_sold_last_24h = 0
-    for user_id, user_data in data["users"].items():
-        for group_key, group_info in data.get("pending_groups", {}).items():
-            if (
-                group_info["seller_id"] == user_id
-                and group_info.get("status") == "approved_waiting_target"
-                and is_within_24_hours(group_info.get("time", ""))
-            ):
-                groups_sold_last_24h += group_info.get("approved_count", 1)
-    text = "📈 *Bot Statistics*\n\n"
-    text += f"👥 *Total Users*: {total_users}\n"
-    text += f"👥 *Users Joined (Last 24h)*: {users_last_24h}\n"
-    text += f"🛒 *Total Groups Sold*: {total_groups_sold}\n"
-    text += f"🛒 *Groups Sold (Last 24h)*: {groups_sold_last_24h}\n"
-    text += "\n*Detailed Breakdown*:\n"
-    for user_id, user_data in data["users"].items():
-        user_sales = user_data.get("sales", 0)
-        if user_sales > 0:
-            text += f"- User {user_id}: {user_sales} groups sold\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-# ------------------------
-# SELL flow (Conversation)
-# ------------------------
-async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if not data.get("sell_enabled", True):
-        await update.message.reply_text("❌ Selling is currently disabled by admin.")
-        return ConversationHandler.END
-    keyboard = [
-        [InlineKeyboardButton("Single Group", callback_data="sell_type_single")],
-        [InlineKeyboardButton("Folder Group", callback_data="sell_type_folder")],
-    ]
-    await update.message.reply_text(
-        "🛍 Please choose the type of submission:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    new_24h = sum(1 for u in data["users"].values() if is_within_24_hours(u.get("start_time", "")))
+    total_sold = sum(u.get("sales", 0) for u in data["users"].values())
+    sold_24h = sum(
+        s.get("count", 0) for u in data["users"].values()
+        for s in u.get("completed_sales", [])
+        if is_within_24_hours(s.get("time", ""))
     )
+    await update.message.reply_text(
+        f"*Bot Statistics*\n\n"
+        f"Total Users: {total_users}\n"
+        f"New (24h): {new_24h}\n"
+        f"Groups Sold: {total_sold}\n"
+        f"Sold (24h): {sold_24h}",
+        parse_mode="Markdown"
+    )
+
+# ========================
+# SELL FLOW
+# ========================
+async def cmd_sell_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not data.get("sell_enabled", True):
+        await update.message.reply_text("Selling is temporarily disabled.")
+        return ConversationHandler.END
+    kb = [
+        [InlineKeyboardButton("Single Group", callback_data="sell_type_single")],
+        [InlineKeyboardButton("Folder", callback_data="sell_type_folder")],
+    ]
+    await update.message.reply_text("Choose type:", reply_markup=InlineKeyboardMarkup(kb))
     return SELL_TYPE
+
 async def sell_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    sell_type = q.data.replace("sell_type_", "")
-    context.user_data["sell_type"] = sell_type
-    context.user_data["in_sell"] = True
-    msg = (
-        "📎 Send your *Telegram group or folder link(s)* (examples: t.me/+ABC, t.me/yourgroup, t.me/addlist/XXX)\n"
-        "You can send multiple links separated by spaces or newlines.\n"
-        f"Maximum {MAX_LINKS_PER_SUBMISSION} links per submission.\n"
-        "Type /cancel to stop. (Auto-cancels after 10 minutes.)\n"
+    context.user_data["sell_type"] = q.data.split("_")[-1]
+    await q.edit_message_text(
+        "Send group/folder link(s)\n"
+        f"• Max {MAX_LINKS_PER_SUBMISSION} per submission\n"
+        "• Separate by space or new line\n"
+        "Example: t.me/+ABC123"
     )
-    if sell_type == "folder":
-        msg += "\nNote: For folders, admin will count the number of groups inside."
-    await q.edit_message_text(msg, parse_mode="Markdown")
     return SELL_LINK
+
 async def sell_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    links = [l.strip() for l in re.split(r"\s+", text) if l.strip()]
+    valid = [l for l in links if INVITE_RE.match(l)]
+    invalid = [l for l in links if l not in valid]
+
+    if not valid:
+        await update.message.reply_text(f"No valid links.\nInvalid: {', '.join(invalid[:5])}")
+        return SELL_LINK
+    if len(valid) > MAX_LINKS_PER_SUBMISSION:
+        await update.message.reply_text(f"Max {MAX_LINKS_PER_SUBMISSION} links allowed.")
+        return SELL_LINK
+
     uid = update.effective_user.id
-    text = (update.message.text or "").strip()
-    if not context.user_data.get("in_sell"):
-        return ConversationHandler.END
-    # Split the message by whitespace or newlines to extract potential links
-    potential_links = [link.strip() for link in text.split() if link.strip()]
-    valid_links = []
-    invalid_links = []
-    # Validate each link
-    for link in potential_links:
-        if INVITE_RE.match(link):
-            valid_links.append(link)
-        else:
-            invalid_links.append(link)
-    if not valid_links:
-        await update.message.reply_text(
-            "❌ No valid Telegram group or folder links found. Please send valid links (e.g., t.me/+ABC, t.me/addlist/XXX) or /cancel to stop.\n"
-            f"Invalid links: {', '.join(invalid_links) if invalid_links else 'None'}"
-        )
-        return SELL_LINK
-    if len(valid_links) > MAX_LINKS_PER_SUBMISSION:
-        await update.message.reply_text(
-            f"❌ Too many links. Maximum {MAX_LINKS_PER_SUBMISSION} links allowed per submission."
-        )
-        return SELL_LINK
-    # Check for duplicates
     s_uid = str(uid)
-    ensure_user(uid)
-    existing_groups = data["users"][s_uid].get("groups", [])
-    duplicates = [link for link in valid_links if link in existing_groups]
-    if duplicates:
-        await update.message.reply_text(
-            f"❌ The following links were already submitted:\n{', '.join(duplicates)}\nPlease send new links or /cancel."
-        )
+    existing = data["users"][s_uid].get("groups", [])
+    dupes = [l for l in valid if l in existing]
+    if dupes:
+        await update.message.reply_text(f"Already submitted:\n" + "\n".join(dupes))
         return SELL_LINK
-    # Store valid links in context for the next step
-    context.user_data["sell_links"] = valid_links
-    logger.info(f"User {uid} submitted valid links: {valid_links}")
+
+    context.user_data["sell_links"] = valid
     await update.message.reply_text(
-        f"✅ Found {len(valid_links)} valid link(s):\n" +
-        "\n".join(valid_links) +
-        "\n\n📅 Please send the year range for these groups/folders (e.g., `2016-22`, `2023`, `2024 (1-3)`):"
+        f"{len(valid)} link(s) accepted!\n\n"
+        "Now send year range:\n"
+        "Examples: `2023`, `2016-22`, `2024 (5-6)`",
+        parse_mode="Markdown"
     )
     return SELL_YEAR
-async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def sell_receive_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    year = update.message.text.strip()
     uid = update.effective_user.id
-    year = (update.message.text or "").strip()
-    if not context.user_data.get("in_sell"):
-        return ConversationHandler.END
-    if not year:
-        await update.message.reply_text("❌ Year range cannot be empty. Please send a valid year (e.g., `2023`, `2016-22`).")
-        return SELL_YEAR
-    global_prices = data.get("global_prices", DEFAULT_PRICES)
-    # Validate year against global or custom prices
-    if year not in global_prices and year not in data["users"][str(uid)].get("custom_prices", {}):
-        await update.message.reply_text(
-            f"❌ Invalid year range. Please use one of: {', '.join(global_prices.keys())} or your custom price ranges."
-        )
-        return SELL_YEAR
     s_uid = str(uid)
     links = context.user_data.get("sell_links", [])
-    if not links:
-        await update.message.reply_text("❌ No links found. Please start over with /sell.")
-        return ConversationHandler.END
-    # Store each link as a pending group/folder
-    try:
-        for link in links:
-            data["pending_groups"][f"{s_uid}:{link}"] = {
-                "link": link,
-                "year": year,
-                "time": now(),
-                "seller_id": s_uid,
-                "ownership_status": "none",
-                "ownership_target_id": None,
-                "status": "pending",
-                "type": context.user_data.get("sell_type", "single")
-            }
-            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
-            if link not in data["users"][s_uid]["groups"]: # Prevent duplicates
-                data["users"][s_uid]["groups"].append(link)
-        save_data(data)
-        logger.info(f"User {uid} submitted year {year} for links: {links}")
-    except Exception as e:
-        logger.error(f"Failed to save pending groups for user {uid}: {e}")
-        await update.message.reply_text("❌ An error occurred while processing your submission. Please try again or contact admin.")
-        return ConversationHandler.END
-    context.user_data.pop("in_sell", None)
-    context.user_data.pop("sell_links", None)
-    # Notify admin with all links
-    kb = [
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{s_uid}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{s_uid}"),
-        ]
-    ]
-    links_text = "\n".join(links)
-    text = f"🆕 New submission\nUser: @{update.effective_user.username or update.effective_user.first_name} (ID: {uid})\nLinks:\n{links_text}\nYear: {year}\nTime: {now()}"
-    try:
-        await context.bot.send_message(
-            ADMIN_ID,
-            text,
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        # Forward to links channel without buttons
-        await context.bot.send_message(
-            LINKS_CHANNEL,
-            text,
-        )
-    except Exception as e:
-        logger.error(f"Failed to notify admin or forward to links channel for user {uid}: {e}")
-        await update.message.reply_text("❌ Failed to notify admin. Please try again later or contact support.")
-        return ConversationHandler.END
-    context.user_data.pop("sell_type", None)
-    await update.message.reply_text(f"✅ {len(links)} link(s) submitted to admin for review. You will be notified on approval/rejection.")
+
+    prices = {**data.get("global_prices", {}), **data["users"][s_uid].get("custom_prices", {})}
+    if year not in prices:
+        await update.message.reply_text(f"Invalid year.\nAvailable: {', '.join(prices.keys())}")
+        return SELL_YEAR
+
+    # Save pending groups
+    for link in links:
+        key = f"{s_uid}:{link}"
+        data["pending_groups"][key] = {
+            "link": link,
+            "year": year,
+            "time": now(),
+            "seller_id": s_uid,
+            "type": context.user_data["sell_type"],
+            "status": "pending"
+        }
+        if link not in data["users"][s_uid]["groups"]:
+            data["users"][s_uid]["groups"].append(link)
+    save_data(data)
+
+    # Notify admins
+    kb = [[
+        InlineKeyboardButton("Approve", callback_data=f"approve_group:{s_uid}"),
+        InlineKeyboardButton("Reject", callback_data=f"reject_group:{s_uid}")
+    ]]
+    text = (
+        f"New submission\n"
+        f"User: {uid} (@{update.effective_user.username or 'NoUsername'})\n"
+        f"Links ({len(links)}):\n" + "\n".join(links) + f"\nYear: {year}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text, reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            pass
+    await context.bot.send_message(LINKS_CHANNEL, text)
+
+    await update.message.reply_text("Submitted for review! You will be notified.")
     return ConversationHandler.END
-async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("in_sell", None)
-    context.user_data.pop("sell_links", None)
-    context.user_data.pop("sell_type", None)
-    context.user_data.pop("withdraw_method", None)
-    context.user_data.pop("withdraw_address", None)
-    context.user_data.pop("admin_mode", None)
-    context.user_data.pop("target_user", None)
-    context.user_data.pop("awaiting_ownership_id", None)
-    context.user_data.pop("awaiting_group_count", None)
-    await update.message.reply_text("❌ Operation cancelled.")
-    return ConversationHandler.END
-# ------------------------
-# WITHDRAW flow (Conversation)
-# ------------------------
+
+# ========================
+# WITHDRAW FLOW
+# ========================
 async def cmd_withdraw_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid == ADMIN_ID:
-        await update.message.reply_text("❌ This command is not available for admin.")
+    if is_admin(update.effective_user.id):
+        await update.message.reply_text("Admins cannot withdraw.")
         return ConversationHandler.END
-    ensure_user(uid)
-    hist = data["users"][str(uid)].get("withdraw_history", [])[-5:]
-    if hist:
-        lines = [f"{h['time']}: {h['amount']}$ via {h['method']} — {h['status']}" for h in hist]
-        await update.message.reply_text("🧾 Your recent withdraws:\n" + "\n".join(lines))
-    keyboard = [
-        [InlineKeyboardButton("🏦 UPI", callback_data="method_upi")],
-        [InlineKeyboardButton("🏦 Binance UID", callback_data="method_binance")],
-        [InlineKeyboardButton("💵 BEP20 USDT", callback_data="method_bep20")],
-        [InlineKeyboardButton("💰 Polygon USDT", callback_data="method_polygon")],
+    kb = [
+        [InlineKeyboardButton("UPI", callback_data="method_upi")],
+        [InlineKeyboardButton("Binance UID", callback_data="method_binance")],
+        [InlineKeyboardButton("BEP20 USDT", callback_data="method_bep20")],
+        [InlineKeyboardButton("Polygon USDT", callback_data="method_polygon")],
     ]
-    await update.message.reply_text("Select withdraw method:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Select withdrawal method:", reply_markup=InlineKeyboardMarkup(kb))
     return WITHDRAW_METHOD
+
 async def withdraw_choose_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    method = q.data.replace("method_", "")
-    context.user_data["withdraw_method"] = method
-    await q.edit_message_text(f"📤 Selected: *{method.upper()}*\nSend your address / UPI ID / UID:", parse_mode="Markdown")
+    context.user_data["withdraw_method"] = q.data.replace("method_", "")
+    await q.edit_message_text(f"Selected: {q.data.replace('method_', '').upper()}\nSend address/UID:")
     return WITHDRAW_ADDRESS
+
 async def withdraw_get_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    addr = (update.message.text or "").strip()
-    method = context.user_data.get("withdraw_method")
+    addr = update.message.text.strip()
+    method = context.user_data["withdraw_method"]
     if not validate_address(method, addr):
-        await update.message.reply_text(f"❌ Invalid {method.upper()} address. Please provide a valid address.")
+        await update.message.reply_text("Invalid address. Try again.")
         return WITHDRAW_ADDRESS
     context.user_data["withdraw_address"] = addr
-    await update.message.reply_text("💰 Now enter the amount to withdraw (numbers only):")
+    await update.message.reply_text("Enter amount to withdraw:")
     return WITHDRAW_AMOUNT
+
 async def withdraw_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
     try:
-        amount = float((update.message.text or "").strip())
+        amount = float(update.message.text.strip())
         if amount <= 0:
-            raise ValueError()
-    except Exception:
-        await update.message.reply_text("❌ Invalid amount. Send numeric value.")
+            raise ValueError
+    except:
+        await update.message.reply_text("Invalid amount.")
         return WITHDRAW_AMOUNT
-    ensure_user(uid)
-    bal = data["users"][str(uid)]["balance"]
+
+    uid = update.effective_user.id
+    s_uid = str(uid)
+    bal = data["users"][s_uid]["balance"]
     if amount > bal:
-        await update.message.reply_text(f"⚠️ Insufficient balance. Your balance: ${bal:.2f}")
+        await update.message.reply_text(f"Insufficient balance. You have ${bal:.2f}")
         return ConversationHandler.END
-    data["pending_withdrawals"][str(uid)] = {
+
+    data["pending_withdrawals"][s_uid] = {
         "method": context.user_data["withdraw_method"],
         "address": context.user_data["withdraw_address"],
         "amount": amount,
-        "time": now(),
-    }
-    rec = {
-        "method": context.user_data["withdraw_method"],
-        "address": context.user_data["withdraw_address"],
-        "amount": amount,
-        "status": "Pending",
         "time": now()
     }
-    data["users"][str(uid)]["withdraw_history"].append(rec)
+    data["users"][s_uid]["withdraw_history"].append({
+        "amount": amount, "method": context.user_data["withdraw_method"],
+        "address": context.user_data["withdraw_address"], "status": "Pending", "time": now()
+    })
     save_data(data)
-    kb = [
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_withdraw:{uid}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_withdraw:{uid}"),
-        ]
-    ]
-    text = f"💸 Withdrawal request\nUser: {uid}\n{amount}$ via {rec['method']}\nAddress: {rec['address']}\nTime: {rec['time']}"
-    await context.bot.send_message(
-        ADMIN_ID,
-        text,
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    # Forward to withdrawals channel without buttons
-    try:
-        await context.bot.send_message(
-            WITHDRAW_CHANNEL,
-            text,
-        )
-    except Exception as e:
-        logger.error(f"Failed to forward to withdrawals channel: {e}")
-    await update.message.reply_text(
-        f"✅ Withdrawal request sent to admin.\n\nDetails:\nAmount: ${amount}\nMethod: {rec['method']}\nAddress: {rec['address']}\nTime: {rec['time']}\n\nYou can check status with /withdraw."
-    )
+
+    kb = [[
+        InlineKeyboardButton("Approve", callback_data=f"approve_withdraw:{uid}"),
+        InlineKeyboardButton("Reject", callback_data=f"reject_withdraw:{uid}")
+    ]]
+    text = f"Withdrawal\nUser: {uid}\n${amount} via {context.user_data['withdraw_method']}\nAddress: {context.user_data['withdraw_address']}"
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text, reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            pass
+    await context.bot.send_message(WITHDRAW_CHANNEL, text)
+
+    await update.message.reply_text("Withdrawal request sent!")
     return ConversationHandler.END
-# ------------------------
-# ADMIN callbacks: groups & withdraws & panel actions
-# ------------------------
+
+# ========================
+# ADMIN CALLBACKS (Groups & Withdrawals)
+# ========================
 async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data_payload = q.data
-    # Group approvals
-    if data_payload.startswith("approve_group:") or data_payload.startswith("reject_group:"):
-        action, uid_s = data_payload.split(":")
-        s_uid = str(uid_s)
-        # Find all pending groups/folders for this user
-        user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "pending"}
-        if not user_pending:
-            await q.edit_message_text("⚠️ No pending submissions found for this user.")
-            return
-        if action == "reject_group":
-            rejected_links = [info["link"] for info in user_pending.values()]
-            for key in list(user_pending.keys()):
-                data["pending_groups"].pop(key, None)
-            save_data(data)
-            try:
-                await context.bot.send_message(
-                    int(s_uid),
-                    f"❌ Your submission(s) were rejected by admin:\n" + "\n".join(rejected_links)
-                )
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of group rejection.")
-            await q.edit_message_text(f"❌ {len(user_pending)} submission(s) rejected.")
-            return
-        # action == approve_group:
-        for key, info in user_pending.items():
-            info["status"] = "approved_waiting_count"
-            info["seller_id"] = info.get("seller_id", s_uid)
-            info["ownership_status"] = info.get("ownership_status", "none")
-            info["ownership_target_id"] = info.get("ownership_target_id", None)
-            data["pending_groups"][key] = info
-        save_data(data)
-        # Check if submission includes folders
-        is_folder_submission = any(info["type"] == "folder" for info in user_pending.values())
-        await q.edit_message_text(f"✅ {len(user_pending)} submission(s) approved.")
-        links_text = "\n".join([info["link"] for info in user_pending.values()])
-        if is_folder_submission:
-            sent_msg = await context.bot.send_message(
-                ADMIN_ID,
-                f"Since this includes folder(s), please reply to this message with the total number of approved groups (counting folders' contents) for user {s_uid}:\n{links_text}"
-            )
-            data["pending_requests"][str(sent_msg.message_id)] = {"type": "count", "seller_id": s_uid, "time": now()}
-        else:
-            for key, info in user_pending.items():
-                info["approved_count"] = 1
-                info["status"] = "approved_waiting_target"
-            save_data(data)
-            sent_msg = await context.bot.send_message(
-                ADMIN_ID,
-                f"Please reply to this message with the Telegram @username or numeric ID of the buyer for these links of user {s_uid}:\n{links_text}"
-            )
-            data["pending_requests"][str(sent_msg.message_id)] = {"type": "buyer", "seller_id": s_uid, "time": now()}
-            try:
-                await context.bot.send_message(
-                    int(s_uid),
-                    f"✅ Your submission(s) were approved by admin:\n{links_text}\nAdmin will send buyer ID for transfer shortly."
-                )
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of group approval.")
-        save_data(data)
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("Not authorized.")
         return
-    # Withdraw approvals
-    if data_payload.startswith("approve_withdraw:") or data_payload.startswith("reject_withdraw:"):
-        action, uid_s = data_payload.split(":")
-        s_uid = str(uid_s)
+
+    data_payload = q.data
+
+    # === GROUP APPROVAL ===
+    if data_payload.startswith(("approve_group:", "reject_group:")):
+        action, seller_id = data_payload.split(":")
+        s_uid = str(seller_id)
+        pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "pending"}
+
+        if action == "reject_group":
+            for k in pending:
+                data["pending_groups"].pop(k, None)
+            save_data(data)
+            await q.edit_message_text(f"{len(pending)} submission(s) rejected.")
+            try:
+                await context.bot.send_message(int(s_uid), f"Your {len(pending)} link(s) were rejected.")
+            except:
+                pass
+            return
+
+        # Approve → ask count if folder, then buyer
+        for k, v in pending.items():
+            v["status"] = "approved_waiting_count" if v["type"] == "folder" else "approved_waiting_target"
+        save_data(data)
+
+        links_text = "\n".join(info["link"] for info in pending.values())
+        if any(v["type"] == "folder" for v in pending.values()):
+            msg = await context.bot.send_message(q.from_user.id, f"Reply with total group count for user {s_uid}:\n{links_text}")
+            data["pending_requests"][str(msg.message_id)] = {"type": "count", "seller_id": s_uid, "time": now()}
+        else:
+            for k, v in pending.items():
+                v["approved_count"] = 1
+                v["status"] = "approved_waiting_target"
+            save_data(data)
+            msg = await context.bot.send_message(q.from_user.id, f"Reply with buyer @username or ID for user {s_uid}:\n{links_text}")
+            data["pending_requests"][str(msg.message_id)] = {"type": "buyer", "seller_id": s_uid, "time": now()}
+        await q.edit_message_text(f"{len(pending)} submission(s) approved.")
+        return
+
+    # === OWNERSHIP SUBMITTED ===
+    if data_payload.startswith("submit_ownership:"):
+        s_uid = data_payload.split(":")[1]
+        if q.from_user.id != int(s_uid):
+            await q.answer("Only seller can press this.")
+            return
+        pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "approved_waiting_target"}
+        for k, v in pending.items():
+            v["ownership_status"] = "transferred"
+        save_data(data)
+        links = "\n".join(v["link"] for v in pending.values())
+        kb = [
+            [InlineKeyboardButton("Verified", callback_data=f"verify_ownership:{s_uid}")],
+            [InlineKeyboardButton("Failed", callback_data=f"reject_ownership:{s_uid}")]
+        ]
+        await context.bot.send_message(q.from_user.id, "Ownership submitted. Awaiting verification.")
+        for admin_id in ADMIN_IDS:
+            await context.bot.send_message(admin_id, f"Ownership submitted by {s_uid}:\n{links}", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    # === FINAL VERIFICATION ===
+    if data_payload.startswith(("verify_ownership:", "reject_ownership:")):
+        action, s_uid = data_payload.split(":")
+        pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "approved_waiting_target"}
+        if action == "verify_ownership":
+            total_credited = 0.0
+            total_groups = 0
+            custom = data["users"][s_uid].get("custom_prices", {})
+            global_p = data.get("global_prices", {})
+            for info in pending.values():
+                year = info["year"]
+                count = info.get("approved_count", 1)
+                price_str = custom.get(year, global_p.get(year, "1$"))
+                price = float(price_str.replace("$", "").replace(",", ""))
+                total_credited += price * count
+                total_groups += count
+            data["users"][s_uid]["balance"] += total_credited
+            data["users"][s_uid]["sales"] += total_groups
+            data["users"][s_uid]["completed_sales"].append({"count": total_groups, "amount": total_credited, "time": now()})
+            for k in pending:
+                data["pending_groups"].pop(k, None)
+            save_data(data)
+            await q.edit_message_text(f"Ownership verified! ${total_credited:.2f} credited.")
+            await context.bot.send_message(int(s_uid), f"Ownership verified!\n{total_groups} groups → ${total_credited:.2f} added.")
+        else:
+            for k, v in pending.items():
+                v["ownership_status"] = "failed"
+            save_data(data)
+            await q.edit_message_text("Ownership marked as failed.")
+            await context.bot.send_message(int(s_uid), "Ownership verification FAILED. Please re-transfer.")
+        return
+
+    # === WITHDRAWAL ===
+    if data_payload.startswith(("approve_withdraw:", "reject_withdraw:")):
+        action, uid = data_payload.split(":")
+        s_uid = str(uid)
         if s_uid not in data["pending_withdrawals"]:
-            await q.edit_message_text("⚠️ This withdrawal was processed or not found.")
+            await q.edit_message_text("Not found.")
             return
         wd = data["pending_withdrawals"].pop(s_uid)
-        hist = data["users"].get(s_uid, {}).get("withdraw_history", [])
-        for rec in reversed(hist):
-            if rec["status"] == "Pending" and rec["amount"] == wd["amount"] and rec["method"] == wd["method"]:
-                rec["status"] = "Approved" if action == "approve_withdraw" else "Rejected"
+        for h in data["users"][s_uid]["withdraw_history"]:
+            if h["status"] == "Pending" and h["amount"] == wd["amount"]:
+                h["status"] = "Approved" if action == "approve_withdraw" else "Rejected"
                 break
         if action == "approve_withdraw":
-            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
-            data["users"][s_uid]["balance"] = max(0.0, data["users"][s_uid]["balance"] - float(wd["amount"]))
-            try:
-                await context.bot.send_message(int(s_uid), f"✅ Your withdrawal of ${wd['amount']} has been approved and processed.")
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of withdrawal approval.")
-            await q.edit_message_text("✅ Withdrawal approved and processed.")
-        else:
-            try:
-                await context.bot.send_message(int(s_uid), f"❌ Your withdrawal of ${wd['amount']} has been rejected.")
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of withdrawal rejection.")
-            await q.edit_message_text("❌ Withdrawal rejected.")
+            data["users"][s_uid]["balance"] -= wd["amount"]
         save_data(data)
+        status = "approved" if action == "approve_withdraw" else "rejected"
+        await q.edit_message_text(f"Withdrawal {status}.")
+        await context.bot.send_message(int(s_uid), f"Your ${wd['amount']} withdrawal was {status}.")
         return
-    # Seller pressed ownership-submitted button
-    if data_payload.startswith("submit_ownership:"):
-        action, s_uid = data_payload.split(":")
-        s_uid = str(s_uid)
-        user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "approved_waiting_target"}
-        if not user_pending:
-            await q.edit_message_text("⚠️ No pending submissions found for this user.")
-            return
-        if str(q.from_user.id) != str(s_uid):
-            await q.answer("❌ Only the seller can press this.")
-            return
-        for key, info in user_pending.items():
-            info["ownership_status"] = "transferred"
-            data["pending_groups"][key] = info
-        save_data(data)
-        kb = [
-            [
-                InlineKeyboardButton("✅ Ownership Verified", callback_data=f"verify_ownership:{s_uid}"),
-                InlineKeyboardButton("❌ Ownership Failed", callback_data=f"reject_ownership:{s_uid}"),
-            ]
-        ]
-        links_text = "\n".join([info["link"] for info in user_pending.values()])
-        text = f"👤 Seller submitted ownership transfer for:\n{links_text}\nTarget: {list(user_pending.values())[0].get('ownership_target_id')}\nPlease verify."
-        try:
-            await context.bot.send_message(
-                ADMIN_ID,
-                text,
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            # Forward to links channel without buttons
-            await context.bot.send_message(
-                LINKS_CHANNEL,
-                text,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to notify admin or forward to channel of ownership submission for user {s_uid}: {e}")
-        await q.edit_message_text(f"✅ Ownership submitted for {len(user_pending)} link(s). Admin will verify shortly.")
-        return
-    # Ownership verification callbacks
-    if data_payload.startswith("verify_ownership:") or data_payload.startswith("reject_ownership:"):
-        action, s_uid = data_payload.split(":")
-        s_uid = str(s_uid)
-        user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] == "approved_waiting_target"}
-        if not user_pending:
-            await q.edit_message_text("⚠️ No pending ownership records found.")
-            return
-        if action == "verify_ownership":
-            data["users"].setdefault(s_uid, {"balance": 0.0, "groups": [], "sales": 0, "withdraw_history": [], "custom_prices": {}, "start_time": now()})
-            custom_prices = data["users"][s_uid].get("custom_prices", {})
-            global_prices = data.get("global_prices", DEFAULT_PRICES)
-            total_credited = 0.0
-            # Get approved_count from the first entry (assuming same for all in submission)
-            approved_count = list(user_pending.values())[0].get("approved_count", len(user_pending))
-            year = list(user_pending.values())[0].get("year")
-            price_str = custom_prices.get(year, global_prices.get(year, "1$"))
-            try:
-                price = float(price_str.replace("$", ""))
-            except ValueError:
-                price = 1.0
-            total_credited = price * approved_count
-            data["users"][s_uid]["sales"] = data["users"][s_uid].get("sales", 0) + approved_count
-            for key in list(user_pending.keys()):
-                data["pending_groups"].pop(key)
-            data["users"][s_uid]["balance"] += total_credited
-            save_data(data)
-            links_text = "\n".join([info["link"] for info in user_pending.values()])
-            try:
-                await context.bot.send_message(
-                    int(s_uid),
-                    f"✅ Ownership verified for {len(user_pending)} link(s) ({approved_count} groups):\n{links_text}\n${total_credited:.2f} credited to your balance."
-                )
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of ownership verification.")
-            await q.edit_message_text(f"✅ Ownership verified for {len(user_pending)} link(s) ({approved_count} groups). ${total_credited:.2f} credited to seller.")
-        else:
-            for key, info in user_pending.items():
-                info["ownership_status"] = "failed"
-                data["pending_groups"][key] = info
-            save_data(data)
-            links_text = "\n".join([info["link"] for info in user_pending.values()])
-            try:
-                await context.bot.send_message(
-                    int(s_uid),
-                    f"❌ Ownership verification FAILED for:\n{links_text}\nPlease re-transfer and press the Ownership Submitted button again."
-                )
-            except:
-                logger.warning(f"Failed to notify user {s_uid} of ownership verification failure.")
-            await q.edit_message_text(f"❌ Ownership verification marked as failed for {len(user_pending)} link(s) and seller notified.")
-        return
-# ------------------------
-# Admin panel (Conversation)
-# ------------------------
+
+# ========================
+# ADMIN PANEL & MULTI-ADMIN
+# ========================
 async def admin_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You are not authorized.")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Not authorized.")
         return ConversationHandler.END
     kb = [
-        [InlineKeyboardButton("👥 Pending Groups", callback_data="admin_pending_groups")],
-        [InlineKeyboardButton("💸 Pending Withdrawals", callback_data="admin_pending_withdrawals")],
-        [InlineKeyboardButton("➕ Add Balance", callback_data="admin_add_balance")],
-        [InlineKeyboardButton("💰 Custom", callback_data="admin_custom")],
-        [InlineKeyboardButton("🔍 Inspect User", callback_data="admin_inspect_user")],
-        [InlineKeyboardButton("🪙 Toggle Sell On/Off", callback_data="admin_toggle_sell")],
-        [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("Pending Groups", callback_data="admin_pending_groups")],
+        [InlineKeyboardButton("Pending Withdrawals", callback_data="admin_pending_withdrawals")],
+        [InlineKeyboardButton("Add Balance", callback_data="admin_add_balance")],
+        [InlineKeyboardButton("Custom Prices", callback_data="admin_custom")],
+        [InlineKeyboardButton("Inspect User", callback_data="admin_inspect_user")],
+        [InlineKeyboardButton("Toggle Sell", callback_data="admin_toggle_sell")],
+        [InlineKeyboardButton("Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("Admins Management", callback_data="admin_manage_admins")],
     ]
-    await update.message.reply_text("🧑‍💻 *Admin Panel* - choose action:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("Admin Panel", reply_markup=InlineKeyboardMarkup(kb))
     return ADMIN_PANEL
+
+# ========================
+# ADMIN PANEL CALLBACKS (Full Multi-Admin System)
+# ========================
 async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != ADMIN_ID:
-        await q.edit_message_text("❌ Only admin.")
+    if not is_admin(q.from_user.id):
+        await q.edit_message_text("Not authorized.")
         return ADMIN_PANEL
+
     key = q.data
-    if key == "admin_custom":
-        kb = [
-            [InlineKeyboardButton("➕ Set Price for User", callback_data="admin_custom_set")],
-            [InlineKeyboardButton("🧼 Remove Price for User", callback_data="admin_custom_remove")],
-            [InlineKeyboardButton("🕵️ View Price for User", callback_data="admin_custom_view")],
-            [InlineKeyboardButton("🌍 Set Global Prices", callback_data="admin_global_prices_set")],
-        ]
-        await q.edit_message_text("💰 Custom Price — choose:", reply_markup=InlineKeyboardMarkup(kb))
-        return ADMIN_PANEL
+
+    # === Pending Groups List ===
     if key == "admin_pending_groups":
-        if not data["pending_groups"]:
-            await q.edit_message_text("📭 No pending groups or folders.")
+        pending = [v for v in data["pending_groups"].values() if v["status"] == "pending"]
+        if not pending:
+            await q.edit_message_text("No pending submissions.")
             return ADMIN_PANEL
-        # Group pending submissions by seller_id
-        grouped_pending = {}
-        for key, info in data["pending_groups"].items():
-            if info["status"] == "pending":
-                seller_id = info["seller_id"]
-                grouped_pending.setdefault(seller_id, []).append(info)
-        for seller_id, infos in grouped_pending.items():
-            kb = [
-                [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_group:{seller_id}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_group:{seller_id}"),
-                ],
-            ]
-            links_text = "\n".join([f"- {info['link']} (Year: {info.get('year', 'N/A')}, Type: {info.get('type', 'single')})" for info in infos])
+        grouped = {}
+        for info in pending:
+            grouped.setdefault(info["seller_id"], []).append(info)
+        for seller_id, items in grouped.items():
+            links = "\n".join(f"• {i['link']} ({i['year']})" for i in items)
+            kb = [[
+                InlineKeyboardButton("Approve", callback_data=f"approve_group:{seller_id}"),
+                InlineKeyboardButton("Reject", callback_data=f"reject_group:{seller_id}")
+            ]]
             await context.bot.send_message(
-                ADMIN_ID,
-                f"👤 Seller ID: {seller_id}\nLinks:\n{links_text}\nSubmitted: {infos[0]['time']}",
+                q.from_user.id,
+                f"Pending from {seller_id}\n{links}",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
-        await q.edit_message_text("📋 Pending groups/folders shown above.")
+        await q.edit_message_text("Check your DMs for pending submissions.")
         return ADMIN_PANEL
+
+    # === Pending Withdrawals ===
     if key == "admin_pending_withdrawals":
         if not data["pending_withdrawals"]:
-            await q.edit_message_text("📭 No pending withdrawals.")
+            await q.edit_message_text("No pending withdrawals.")
             return ADMIN_PANEL
-        for s_uid, w in list(data["pending_withdrawals"].items()):
-            kb = [
-                [
-                    InlineKeyboardButton("✅ Approve", callback_data=f"approve_withdraw:{s_uid}"),
-                    InlineKeyboardButton("❌ Reject", callback_data=f"reject_withdraw:{s_uid}"),
-                ],
-            ]
+        for uid, w in data["pending_withdrawals"].items():
+            kb = [[
+                InlineKeyboardButton("Approve", callback_data=f"approve_withdraw:{uid}"),
+                InlineKeyboardButton("Reject", callback_data=f"reject_withdraw:{uid}")
+            ]]
             await context.bot.send_message(
-                ADMIN_ID,
-                f"👤 {s_uid} ➝ {w['amount']}$ via {w['method']} ({w['address']})",
+                q.from_user.id,
+                f"{uid} → ${w['amount']} via {w['method']}\n{w['address']}",
                 reply_markup=InlineKeyboardMarkup(kb)
             )
-        await q.edit_message_text("💸 Pending withdrawals shown above.")
+        await q.edit_message_text("Check DMs for withdrawals.")
         return ADMIN_PANEL
+
+    # === Add Balance ===
     if key == "admin_add_balance":
         context.user_data["admin_mode"] = "add_balance"
-        await q.edit_message_text("➕ Send user ID to add balance to:")
+        await q.edit_message_text("Send user ID to add balance:")
         return ADMIN_ADD_USER
+
+    # === Inspect User ===
     if key == "admin_inspect_user":
-        context.user_data["admin_mode"] = "inspect_user"
-        await q.edit_message_text("🔍️ Send user ID to inspect:")
+        context.user_data["admin_mode"] = "inspect"
+        await q.edit_message_text("Send user ID to inspect:")
         return ADMIN_INSPECT_USER
+
+    # === Toggle Sell ===
     if key == "admin_toggle_sell":
         data["sell_enabled"] = not data.get("sell_enabled", True)
         save_data(data)
-        await q.edit_message_text(f"⚙️ Selling is now {'ENABLED' if data['sell_enabled'] else 'DISABLED'}.")
+        await q.edit_message_text(f"Selling: {'ON' if data['sell_enabled'] else 'OFF'}")
         return ADMIN_PANEL
+
+    # === Broadcast ===
     if key == "admin_broadcast":
         context.user_data["admin_mode"] = "broadcast"
-        await q.edit_message_text("📢 Send broadcast text to send to all users:")
+        await q.edit_message_text("Send broadcast message:")
         return ADMIN_BROADCAST
-    if key == "admin_custom_set":
-        context.user_data["admin_mode"] = "custom_set_user"
-        await q.edit_message_text("👤 Send the user ID (numeric) to set custom prices for:")
-        return ADMIN_PANEL
-    if key == "admin_custom_remove":
-        context.user_data["admin_mode"] = "custom_remove_user"
-        await q.edit_message_text("👤 Send the user ID (numeric) to remove custom prices for:")
-        return ADMIN_PANEL
-    if key == "admin_custom_view":
-        context.user_data["admin_mode"] = "custom_view_user"
-        await q.edit_message_text("👤 Send the user ID (numeric) to view current custom prices for:")
-        return ADMIN_PANEL
-    if key == "admin_global_prices_set":
-        context.user_data["admin_mode"] = "global_prices_set_value"
+
+    # === Admins Management (Only Owner) ===
+    if key == "admin_manage_admins":
+        if q.from_user.id != OWNER_ID:
+            await q.edit_message_text("Only the Owner can manage admins.")
+            return ADMIN_PANEL
+        kb = [
+            [InlineKeyboardButton("Add Admin", callback_data="admin_add")],
+            [InlineKeyboardButton("Remove Admin", callback_data="admin_remove")],
+            [InlineKeyboardButton("List Admins", callback_data="admin_list")],
+            [InlineKeyboardButton("Back", callback_data="admin_back")]
+        ]
         await q.edit_message_text(
-            "✍️ Send global prices like: `2016-22: 10$` or multiple separated by comma\nExample: `2016-22: 10$, 2023: 5$`"
+            f"Admins Management\nCurrent: {len(ADMIN_IDS)}\nOnly Owner can do this.",
+            reply_markup=InlineKeyboardMarkup(kb)
         )
         return ADMIN_PANEL
-    await q.edit_message_text("⚠️ Unknown admin action.")
-    return ADMIN_PANEL
-async def admin_add_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    try:
-        uid = int(update.message.text.strip())
-    except:
-        await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
-        return ADMIN_ADD_USER
-    context.user_data["target_user"] = uid
-    await update.message.reply_text(f"Send amount to add to user {uid}:")
-    return ADMIN_ADD_AMOUNT
-async def admin_add_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    try:
-        amt = float(update.message.text.strip())
-        if amt <= 0:
-            raise ValueError
-    except:
-        await update.message.reply_text("❌ Invalid amount. Send a positive number.")
-        return ADMIN_ADD_AMOUNT
-    uid = context.user_data.pop("target_user", None)
-    if uid is None:
-        await update.message.reply_text("❌ No target user set. Start again.")
-        return ConversationHandler.END
-    ensure_user(uid)
-    data["users"][str(uid)]["balance"] = data["users"][str(uid)].get("balance", 0.0) + amt
-    save_data(data)
-    await update.message.reply_text(f"✅ Added ${amt:.2f} to {uid}. New balance: ${data['users'][str(uid)]['balance']:.2f}")
-    try:
-        await context.bot.send_message(
-            uid,
-            f"💵 Admin added ${amt:.2f} to your balance. New balance: ${data['users'][str(uid)]['balance']:.2f}"
-        )
-    except:
-        logger.warning(f"Failed to notify user {uid} of balance addition.")
-    return ADMIN_PANEL
-async def admin_inspect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    try:
-        uid = int(update.message.text.strip())
-    except:
-        await update.message.reply_text("❌ Invalid user ID.")
-        return ADMIN_INSPECT_USER
-    ensure_user(uid)
-    u = data["users"][str(uid)]
-    pending_g = [info["link"] for key, info in data["pending_groups"].items() if info["seller_id"] == str(uid)]
-    pending_w = data["pending_withdrawals"].get(str(uid))
-    text = (
-        f"🔎 User: {uid}\n"
-        f"💰 Balance: ${u['balance']:.2f}\n"
-        f"🛒 Total groups submitted: {len(u.get('groups', []))}\n"
-        f"✅ Sales (approved): {u.get('sales', 0)}\n"
-        f"⏳ Pending groups/folders: {', '.join(pending_g) if pending_g else 'None'}\n"
-        f"⏳ Pending withdraw: {pending_w['amount'] if pending_w else 'None'}\n"
-        f"📝 Withdraw history (last 5):\n"
-    )
-    for rec in u.get("withdraw_history", [])[-5:]:
-        text += f"- {rec['time']}: {rec['amount']}$ via {rec['method']} — {rec['status']}\n"
-    if u.get("custom_prices"):
-        text += "\n💠 Custom Prices:\n"
-        for y, p in u["custom_prices"].items():
-            text += f"- {y}: {p}\n"
-    await update.message.reply_text(text)
-    return ADMIN_PANEL
-async def admin_broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return ConversationHandler.END
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("❌ Broadcast message cannot be empty.")
-        return ADMIN_BROADCAST
-    count = 0
-    for s_uid in list(data["users"].keys()):
+
+    if key == "admin_add":
+        if q.from_user.id != OWNER_ID:
+            return ADMIN_PANEL
+        context.user_data["awaiting_admin_id"] = True
+        await q.edit_message_text("Send @username or numeric ID of new admin:")
+        return ADMIN_PANEL
+
+    if key == "admin_remove":
+        if q.from_user.id != OWNER_ID:
+            return ADMIN_PANEL
+        if len(ADMIN_IDS) <= 1:
+            await q.edit_message_text("Cannot remove last admin.")
+            return ADMIN_PANEL
+        kb = []
+        for aid in ADMIN_IDS:
+            if aid == OWNER_ID: continue
+            kb.append([InlineKeyboardButton(f"Remove {aid}", callback_data=f"remove_admin:{aid}")])
+        kb.append([InlineKeyboardButton("Back", callback_data="admin_manage_admins")])
+        await q.edit_message_text("Select admin to remove:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_PANEL
+
+    if key == "admin_list":
+        text = "*Current Admins:*\n"
+        for i, aid in enumerate(sorted(ADMIN_IDS), 1):
+            text += f"{i}. <code>{aid}</code>{' (Owner)' if aid == OWNER_ID else ''}\n"
+        await q.edit_message_text(text, parse_mode="Markdown")
+        return ADMIN_PANEL
+
+    if key.startswith("remove_admin:"):
+        if q.from_user.id != OWNER_ID:
+            return ADMIN_PANEL
+        remove_id = int(key.split(":")[1])
+        if remove_id == OWNER_ID:
+            await q.edit_message_text("Cannot remove Owner.")
+            return ADMIN_PANEL
+        ADMIN_IDS.remove(remove_id)
+        save_admins()
+        await q.edit_message_text(f"Admin {remove_id} removed.")
         try:
-            await context.bot.send_message(int(s_uid), f"📢 Broadcast from admin:\n\n{text}")
-            count += 1
+            await context.bot.send_message(remove_id, "You have been removed from bot admins.")
         except:
-            logger.warning(f"Failed to send broadcast to user {s_uid}.")
-    await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
-    return ADMIN_PANEL
-# ------------------------
-# Router for reply-keyboard (only when not in a conversation)
-# and also handles admin custom-price text flow
-# ------------------------
-async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID and context.user_data.get("admin_mode"):
-        mode = context.user_data.get("admin_mode")
-        if mode == "custom_set_user":
-            target_uid = (update.message.text or "").strip()
-            try:
-                tid = int(target_uid)
-            except:
-                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
-                return
-            ensure_user(tid)
-            context.user_data["target_user"] = str(tid)
-            context.user_data["admin_mode"] = "custom_set_value"
-            await update.message.reply_text(
-                "✍️ Send price like: `2016-22: 10$` or multiple separated by comma\nExample: `2016-22: 10$, 2023: 5$`"
-            )
-            return
-        if mode == "custom_set_value":
-            target_uid = context.user_data.get("target_user")
-            txt = (update.message.text or "").strip()
-            parts = [p.strip() for p in txt.split(",")]
-            new_prices = {}
-            try:
-                for p in parts:
-                    if ":" in p:
-                        yr, val = p.split(":", 1)
-                        val = val.strip()
-                        if not val.endswith("$"):
-                            val += "$"
-                        new_prices[yr.strip()] = val
-                data["users"][target_uid]["custom_prices"] = new_prices
-                save_data(data)
-                await update.message.reply_text(f"✅ Custom prices set for user {target_uid}: {new_prices}")
-                try:
-                    await context.bot.send_message(
-                        int(target_uid),
-                        f"💰 Your custom group prices have been updated: {new_prices}"
-                    )
-                except:
-                    logger.warning(f"Failed to notify user {target_uid} of custom price update.")
-                context.user_data.pop("admin_mode", None)
-                context.user_data.pop("target_user", None)
-            except:
-                await update.message.reply_text(
-                    "❌ Invalid format. Use `year1:price1,year2:price2` (e.g., `2016-22:10$,2023:5$`)."
-                )
-                return
-            return
-        if mode == "custom_remove_user":
-            target_uid = (update.message.text or "").strip()
-            try:
-                tid = int(target_uid)
-            except:
-                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
-                return
-            ensure_user(tid)
-            if not data["users"][str(tid)].get("custom_prices"):
-                await update.message.reply_text("⚠️ No custom prices found for this user.")
-                context.user_data.pop("admin_mode", None)
-                return
-            context.user_data["target_user"] = str(tid)
-            context.user_data["admin_mode"] = "custom_remove_action"
-            years = "\n".join(data["users"][str(tid)]["custom_prices"].keys())
-            await update.message.reply_text(
-                f"🧼 Custom prices for user {tid}:\n{years}\n\n"
-                "Type specific year to remove (e.g., `2023`) or type `all` to remove all custom prices."
-            )
-            return
-        if mode == "custom_remove_action":
-            target_uid = context.user_data.get("target_user")
-            year = (update.message.text or "").strip()
-            if year.lower() == "all":
-                data["users"][target_uid]["custom_prices"] = {}
-                save_data(data)
-                await update.message.reply_text(f"✅ All custom prices removed for user {target_uid}")
-            else:
-                if year in data["users"][target_uid]["custom_prices"]:
-                    del data["users"][target_uid]["custom_prices"][year]
-                    save_data(data)
-                    await update.message.reply_text(f"✅ Removed custom price for year {year} from user {target_uid}")
-                else:
-                    await update.message.reply_text(f"⚠️ No custom price found for year {year}.")
-            context.user_data.pop("admin_mode", None)
-            context.user_data.pop("target_user", None)
-            return
-        if mode == "custom_view_user":
-            target_uid = (update.message.text or "").strip()
-            try:
-                tid = int(target_uid)
-            except:
-                await update.message.reply_text("❌ Invalid user ID. Send numeric ID.")
-                return
-            ensure_user(tid)
-            user_prices = data["users"][str(tid)].get("custom_prices", {})
-            if user_prices:
-                text = "🕵️ *Custom Prices for this User:*\n"
-                for k, v in user_prices.items():
-                    text += f"📅 {k}: {v}\n"
-                await update.message.reply_text(text, parse_mode="Markdown")
-            else:
-                await update.message.reply_text("⚠️ No custom prices set for this user.")
-            context.user_data.pop("admin_mode", None)
-            return
-        if mode == "global_prices_set_value":
-            txt = (update.message.text or "").strip()
-            parts = [p.strip() for p in txt.split(",")]
-            new_prices = {}
-            try:
-                for p in parts:
-                    if ":" in p:
-                        yr, val = p.split(":", 1)
-                        val = val.strip()
-                        if not val.endswith("$"):
-                            val += "$"
-                        new_prices[yr.strip()] = val
-                data["global_prices"] = new_prices
-                save_data(data)
-                await update.message.reply_text(f"✅ Global prices updated: {new_prices}")
-                context.user_data.pop("admin_mode", None)
-            except:
-                await update.message.reply_text(
-                    "❌ Invalid format. Use `year1:price1,year2:price2` (e.g., `2016-22:10$,2023:5$`)."
-                )
-                return
-            return
+            pass
+        return ADMIN_PANEL
 
-    # Handle pending requests (count or buyer) via reply
-    if update.message.reply_to_message:
-        reply_id = str(update.message.reply_to_message.message_id)
-        if reply_id in data.get("pending_requests", {}):
-            req = data["pending_requests"].pop(reply_id)
-            save_data(data)
-            s_uid = req["seller_id"]
-            txt = update.message.text.strip()
-            user_pending = {k: v for k, v in data["pending_groups"].items() if v["seller_id"] == s_uid and v["status"] in ["approved_waiting_count", "approved_waiting_target"]}
-            if not user_pending:
-                await update.message.reply_text("⚠️ Pending submission not found.")
-                return
-            links_text = "\n".join([info["link"] for info in user_pending.values()])
-            if req["type"] == "count":
-                try:
-                    count = int(txt)
-                    if count <= 0:
-                        raise ValueError
-                except:
-                    await update.message.reply_text("❌ Invalid count. Please reply again with a positive integer.")
-                    return
-                for key, info in user_pending.items():
-                    if info["status"] == "approved_waiting_count":
-                        info["approved_count"] = count
-                        info["status"] = "approved_waiting_target"
-                save_data(data)
-                await update.message.reply_text(f"✅ Count set to {count} for user {s_uid}.")
-                # Notify seller
-                try:
-                    await context.bot.send_message(
-                        int(s_uid),
-                        f"✅ Your submission(s) were approved by admin ({count} groups):\n{links_text}\nAdmin will send buyer ID for transfer shortly."
-                    )
-                except:
-                    logger.warning(f"Failed to notify user {s_uid} of group approval.")
-                # Ask for buyer ID
-                sent_msg = await context.bot.send_message(
-                    ADMIN_ID,
-                    f"Please reply to this message with the Telegram @username or numeric ID of the buyer for these links of user {s_uid}:\n{links_text}"
-                )
-                data["pending_requests"][str(sent_msg.message_id)] = {"type": "buyer", "seller_id": s_uid, "time": now()}
-                save_data(data)
-                return
-            elif req["type"] == "buyer":
-                target_id = txt
-                for key, pg in user_pending.items():
-                    if pg["status"] == "approved_waiting_target":
-                        pg["ownership_status"] = "requested"
-                        pg["ownership_target_id"] = target_id
-                save_data(data)
-                try:
-                    await context.bot.send_message(
-                        int(s_uid),
-                        f"📢 Please transfer the group/folder ownership for:\n{links_text}\nTo: {target_id}\n\nAfter you transfer ownership, press the button below to notify admin.",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("✅ Ownership Submitted", callback_data=f"submit_ownership:{s_uid}")]
-                        ])
-                    )
-                except:
-                    logger.warning(f"Failed to notify user {s_uid} of ownership target.")
-                await update.message.reply_text(f"✅ Ownership target set to {target_id} for {len(user_pending)} link(s) and seller notified.")
-                return
-
-    txt = (update.message.text or "").strip()
-    uid = update.effective_user.id
-    ensure_user(uid)
-    if txt == "🏠 Start":
-        await on_start(update, context)
-    elif txt == "💰 Prices":
-        await cmd_price(update, context)
-    elif txt == "🛍 Sell":
-        return await cmd_sell_entry(update, context)
-    elif txt == "💸 Withdraw" and uid != ADMIN_ID:
-        return await cmd_withdraw_entry(update, context)
-    elif txt == "💵 Balance" and uid != ADMIN_ID:
-        await cmd_balance(update, context)
-    elif txt == "📈 Stats" and uid == ADMIN_ID:
-        return await cmd_stats(update, context)
-    elif txt == "🧑‍💻 Admin" and uid == ADMIN_ID:
+    if key == "admin_back":
         return await admin_panel_entry(update, context)
-    else:
-        await update.message.reply_text("⚠️ Unknown option or use buttons/commands. If responding to a pending request, make sure to reply to the specific message.")
+
+    # === Custom Prices Menu ===
+    if key == "admin_custom":
+        kb = [
+            [InlineKeyboardButton("Set Custom Price", callback_data="custom_set")],
+            [InlineKeyboardButton("Remove Custom Price", callback_data="custom_remove")],
+            [InlineKeyboardButton("View User Prices", callback_data="custom_view")],
+            [InlineKeyboardButton("Set Global Prices", callback_data="global_prices")]
+        ]
+        await q.edit_message_text("Custom Prices Menu:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_PANEL
+
+    await q.edit_message_text("Unknown action.")
+    return ADMIN_PANEL
+
 # ========================
-# App setup
+# Text Handlers for Admin Modes
+# ========================
+async def handle_admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    mode = context.user_data.get("admin_mode")
+    text = update.message.text.strip()
+
+    # === Add Balance ===
+    if mode == "add_balance":
+        try:
+            uid = int(text)
+            context.user_data["target_user"] = uid
+            context.user_data["admin_mode"] = "add_amount"
+            await update.message.reply_text(f"Send amount to add to {uid}:")
+        except:
+            await update.message.reply_text("Invalid ID.")
+        return
+
+    if mode == "add_amount":
+        try:
+            amt = float(text)
+            uid = context.user_data.pop("target_user", None)
+            ensure_user(uid)
+            data["users"][str(uid)]["balance"] += amt
+            save_data(data)
+            await update.message.reply_text(f"Added ${amt} to {uid}\nNew balance: ${data['users'][str(uid)]['balance']:.2f}")
+            try:
+                await context.bot.send_message(uid, f"Admin added ${amt} to your balance!")
+            except:
+                pass
+            context.user_data.pop("admin_mode", None)
+        except:
+            await update.message.reply_text("Invalid amount.")
+        return
+
+    # === Inspect User ===
+    if mode == "inspect":
+        try:
+            uid = int(text)
+            ensure_user(uid)
+            u = data["users"][str(uid)]
+            await update.message.reply_text(
+                f"User: {uid}\n"
+                f"Balance: ${u['balance']:.2f}\n"
+                f"Sales: {u.get('sales', 0)}\n"
+                f"Submitted: {len(u.get('groups', []))}\n"
+                f"Custom Prices: {u.get('custom_prices', 'None')}"
+            )
+            context.user_data.pop("admin_mode", None)
+        except:
+            await update.message.reply_text("Invalid ID.")
+        return
+
+    # === Broadcast ===
+    if mode == "broadcast":
+        count = 0
+        for uid in data["users"]:
+            try:
+                await context.bot.send_message(int(uid), f"Announcement:\n\n{text}")
+                count += 1
+            except:
+                pass
+        await update.message.reply_text(f"Broadcast sent to {count} users.")
+        context.user_data.pop("admin_mode", None)
+        return
+
+    # === Add New Admin (from text) ===
+    if context.user_data.get("awaiting_admin_id"):
+        new_id = None
+        if text.isdigit():
+            new_id = int(text)
+        else:
+            try:
+                chat = await context.bot.get_chat(text)
+                new_id = chat.id
+            except:
+                await update.message.reply_text("User not found.")
+                return
+        if new_id in ADMIN_IDS:
+            await update.message.reply_text("Already an admin.")
+        else:
+            ADMIN_IDS.add(new_id)
+            save_admins()
+            await update.message.reply_text(f"Added admin: {new_id}")
+            try:
+                await context.bot.send_message(new_id, "You are now an admin!")
+            except:
+                pass
+        context.user_data.pop("awaiting_admin_id", None)
+        return
+
+# ========================
+# Register Admin Panel Handlers
+# ========================
+# Add these in main():
+app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
+app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^(custom_|global_prices|remove_admin:)"))
+
+# Update admin_conv states:
+admin_conv = ConversationHandler(
+    entry_points=[CommandHandler("admin", admin_panel_entry), MessageHandler(filters.Regex("^Admin$"), admin_panel_entry)],
+    states={
+        ADMIN_PANEL: [CallbackQueryHandler(admin_panel_callback)],
+        ADMIN_ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text)],
+        ADMIN_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text)],
+        ADMIN_INSPECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text)],
+        ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_text)],
+    },
+    fallbacks=[CommandHandler("cancel", universal_cancel)],
+    allow_reentry=True,
+)
+
+# ========================
+# UNIVERSAL CANCEL
+# ========================
+async def universal_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+# ========================
+# MAIN ROUTER (buttons + pending replies)
+# ========================
+async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message else ""
+    uid = update.effective_user.id
+
+    if text == "Start":
+        await on_start(update, context)
+    elif text == "Prices":
+        await cmd_price(update, context)
+    elif text == "Sell":
+        return await cmd_sell_entry(update, context)
+    elif text == "Withdraw":
+        return await cmd_withdraw_entry(update, context)
+    elif text == "Balance":
+        await cmd_balance(update, context)
+    elif text == "Stats" and is_admin(uid):
+        await cmd_stats(update, context)
+    elif text == "Admin" and is_admin(uid):
+        return await admin_panel_entry(update, context)
+
+# ========================
+# APP SETUP
 # ========================
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     sell_conv = ConversationHandler(
-        entry_points=[CommandHandler("sell", cmd_sell_entry), MessageHandler(filters.Regex("🛍 Sell$"), cmd_sell_entry)],
+        entry_points=[CommandHandler("sell", cmd_sell_entry), MessageHandler(filters.Regex("^Sell$"), cmd_sell_entry)],
         states={
-            SELL_TYPE: [CallbackQueryHandler(sell_choose_type, pattern="^sell_type_")],
+            SELL_TYPE: [CallbackQueryHandler(sell_choose_type, "^sell_type_")],
             SELL_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_link)],
             SELL_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_receive_year)],
         },
         fallbacks=[CommandHandler("cancel", universal_cancel)],
         conversation_timeout=600,
     )
+
     withdraw_conv = ConversationHandler(
-        entry_points=[CommandHandler("withdraw", cmd_withdraw_entry), MessageHandler(filters.Regex("💸 Withdraw$"), cmd_withdraw_entry)],
+        entry_points=[CommandHandler("withdraw", cmd_withdraw_entry), MessageHandler(filters.Regex("^Withdraw$"), cmd_withdraw_entry)],
         states={
-            WITHDRAW_METHOD: [CallbackQueryHandler(withdraw_choose_method, pattern="^method_")],
+            WITHDRAW_METHOD: [CallbackQueryHandler(withdraw_choose_method, "^method_")],
             WITHDRAW_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_get_address)],
             WITHDRAW_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_get_amount)],
         },
         fallbacks=[CommandHandler("cancel", universal_cancel)],
         conversation_timeout=600,
     )
+
     admin_conv = ConversationHandler(
-        entry_points=[CommandHandler("admin", admin_panel_entry), MessageHandler(filters.Regex("🧑‍💻 Admin$"), admin_panel_entry)],
-        states={
-            ADMIN_PANEL: [CallbackQueryHandler(admin_panel_callback, pattern="^admin_")],
-            ADMIN_ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_user_handler)],
-            ADMIN_ADD_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_amount_handler)],
-            ADMIN_INSPECT_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_inspect_handler)],
-            ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_handler)],
-        },
+        entry_points=[CommandHandler("admin", admin_panel_entry), MessageHandler(filters.Regex("^Admin$"), admin_panel_entry)],
+        states={ADMIN_PANEL: [CallbackQueryHandler(admin_panel_entry, "^admin_")]},
         fallbacks=[CommandHandler("cancel", universal_cancel)],
-        conversation_timeout=600,
         allow_reentry=True,
     )
+
     app.add_handler(sell_conv)
     app.add_handler(withdraw_conv)
     app.add_handler(admin_conv)
-    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^(approve_group|reject_group|approve_withdraw|reject_withdraw|submit_ownership|verify_ownership|reject_ownership):"))
-    app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^admin_"))
+    app.add_handler(CallbackQueryHandler(admin_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, button_router))
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("cancel", universal_cancel))
-    logger.info("Bot starting...")
+
+    logger.info("Bot started!")
     app.run_polling()
+
 if __name__ == "__main__":
     main()
