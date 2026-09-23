@@ -21,7 +21,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("8640257221:AAE0QEOy-QXh6feu4kxHPkALh5IBr9mHeRc")
+BOT_TOKEN = os.getenv("8757442283:AAETRTOQOlWdMqJnNigyYYh7eiVRA4ihcco")
 ADMIN_ID = os.getenv("5405985282")
 USDT_TO_INR_RATE = os.getenv("USDT_TO_INR_RATE", "92.50")
 
