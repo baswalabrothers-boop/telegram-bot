@@ -1,83 +1,69 @@
 import os
 import sqlite3
 import logging
-import asyncio
+import threading
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    ConversationHandler,
     ContextTypes,
     filters,
-    ConversationHandler,
 )
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("8757442283:AAETRTOQOlWdMqJnNigyYYh7eiVRA4ihcco")
+BOT_TOKEN = os.getenv("8640257221:AAE0QEOy-QXh6feu4kxHPkALh5IBr9mHeRc")
 ADMIN_ID = os.getenv("5405985282")
+USDT_TO_INR_RATE = os.getenv("USDT_TO_INR_RATE", "92.50")
 
-# Example:
-# USDT_TO_INR_RATE=92.50
-RATE = Decimal(os.getenv("USDT_TO_INR_RATE", "92.50"))
-
+PORT = int(os.getenv("PORT", "8080"))
 DB_FILE = os.getenv("DB_FILE", "orders.db")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is missing.")
+    raise RuntimeError("BOT_TOKEN is missing")
 
 if not ADMIN_ID:
-    raise RuntimeError("ADMIN_ID environment variable is missing.")
+    raise RuntimeError("ADMIN_ID is missing")
 
 ADMIN_ID = int(ADMIN_ID)
+RATE = Decimal(USDT_TO_INR_RATE)
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# CONVERSATION STATES
-# ============================================================
-
-(
-    CHOOSE_ACTION,
-    ENTER_AMOUNT,
-    ENTER_PAYMENT,
-    ENTER_WALLET,
-) = range(4)
 
 # ============================================================
 # DATABASE
 # ============================================================
 
 
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+def db():
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
 
 
 def init_db():
-    conn = get_db()
 
-    conn.execute(
+    connection = db()
+
+    connection.execute(
         """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,14 +76,16 @@ def init_db():
             rate TEXT NOT NULL,
             payment_info TEXT,
             wallet_address TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
+            status TEXT DEFAULT 'PENDING',
             created_at TEXT NOT NULL
         )
         """
     )
 
-    conn.commit()
-    conn.close()
+    connection.commit()
+    connection.close()
+
+    logger.info("Database initialized")
 
 
 def create_order(
@@ -107,13 +95,13 @@ def create_order(
     action,
     usdt_amount,
     inr_amount,
-    rate,
     payment_info=None,
     wallet_address=None,
 ):
-    conn = get_db()
 
-    cursor = conn.execute(
+    connection = db()
+
+    cursor = connection.execute(
         """
         INSERT INTO orders (
             telegram_id,
@@ -128,7 +116,7 @@ def create_order(
             status,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             telegram_id,
@@ -137,79 +125,112 @@ def create_order(
             action,
             str(usdt_amount),
             str(inr_amount),
-            str(rate),
+            str(RATE),
             payment_info,
             wallet_address,
+            "PENDING",
             datetime.utcnow().isoformat(),
         ),
     )
 
     order_id = cursor.lastrowid
 
-    conn.commit()
-    conn.close()
+    connection.commit()
+    connection.close()
 
     return order_id
 
 
 def get_order(order_id):
-    conn = get_db()
 
-    order = conn.execute(
-        "SELECT * FROM orders WHERE id = ?",
+    connection = db()
+
+    order = connection.execute(
+        "SELECT * FROM orders WHERE id=?",
         (order_id,),
     ).fetchone()
 
-    conn.close()
+    connection.close()
 
     return order
 
 
-def update_order_status(order_id, status):
-    conn = get_db()
+def update_order(order_id, status):
 
-    conn.execute(
+    connection = db()
+
+    connection.execute(
         """
         UPDATE orders
-        SET status = ?
-        WHERE id = ?
+        SET status=?
+        WHERE id=?
         """,
         (status, order_id),
     )
 
-    conn.commit()
-    conn.close()
-
-
-def get_user_orders(telegram_id, limit=10):
-    conn = get_db()
-
-    orders = conn.execute(
-        """
-        SELECT *
-        FROM orders
-        WHERE telegram_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (telegram_id, limit),
-    ).fetchall()
-
-    conn.close()
-
-    return orders
+    connection.commit()
+    connection.close()
 
 
 # ============================================================
-# HELPERS
+# HEALTH SERVER FOR CHOREO
 # ============================================================
 
 
-def format_money(value):
-    return f"₹{Decimal(str(value)):,.2f}"
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+
+        if self.path == "/":
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+
+            self.wfile.write(
+                b"USDT INR Telegram Bot is running"
+            )
+
+        elif self.path == "/health":
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+
+            self.wfile.write(
+                b'{"status":"ok"}'
+            )
+
+        else:
+
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
 
 
-def main_menu():
+def start_health_server():
+
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler,
+    )
+
+    logger.info(
+        f"Health server running on port {PORT}"
+    )
+
+    server.serve_forever()
+
+
+# ============================================================
+# MENU
+# ============================================================
+
+
+def menu():
+
     keyboard = [
         [
             InlineKeyboardButton(
@@ -223,11 +244,9 @@ def main_menu():
         ],
         [
             InlineKeyboardButton(
-                "📊 Current Rate",
+                "📊 Rate",
                 callback_data="RATE",
             ),
-        ],
-        [
             InlineKeyboardButton(
                 "📋 My Orders",
                 callback_data="ORDERS",
@@ -238,265 +257,86 @@ def main_menu():
     return InlineKeyboardMarkup(keyboard)
 
 
-def admin_order_keyboard(order_id):
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "✅ Approve",
-                callback_data=f"APPROVE_{order_id}",
-            ),
-            InlineKeyboardButton(
-                "❌ Reject",
-                callback_data=f"REJECT_{order_id}",
-            ),
-        ]
-    ]
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
-
-
 # ============================================================
 # START
 # ============================================================
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     user = update.effective_user
 
-    text = (
-        f"👋 Hello {user.first_name}!\n\n"
-        "Welcome to the USDT/INR exchange bot.\n\n"
-        f"💱 Current rate: {format_money(RATE)} per USDT\n\n"
-        "Choose an option below:"
+    logger.info(
+        f"/start received from {user.id}"
     )
 
     await update.message.reply_text(
-        text,
-        reply_markup=main_menu(),
+        f"👋 Hello {user.first_name}!\n\n"
+        "Welcome to the USDT/INR exchange bot.\n\n"
+        f"💱 Current rate:\n"
+        f"1 USDT = ₹{RATE}\n\n"
+        "Choose an option:",
+        reply_markup=menu(),
     )
 
 
 # ============================================================
-# RATE
+# BUTTONS
 # ============================================================
 
 
-async def show_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     query = update.callback_query
 
     await query.answer()
 
-    await query.message.reply_text(
-        f"💱 Current USDT/INR Rate\n\n"
-        f"1 USDT = {format_money(RATE)}\n\n"
-        "Rates may be changed by the administrator."
-    )
+    if query.data == "RATE":
 
+        await query.message.reply_text(
+            f"💱 Current Rate\n\n"
+            f"1 USDT = ₹{RATE}"
+        )
 
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
+        return ConversationHandler.END
 
+    if query.data == "ORDERS":
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+        await query.message.reply_text(
+            "📋 Order history feature is available through /orders."
+        )
 
-    await query.answer()
+        return ConversationHandler.END
 
-    data = query.data
-
-    # --------------------------------------------------------
-    # BUY
-    # --------------------------------------------------------
-
-    if data == "BUY":
+    if query.data == "BUY":
 
         context.user_data.clear()
 
         context.user_data["action"] = "BUY"
 
         await query.message.reply_text(
-            "💰 Buy USDT\n\n"
-            "Enter the amount of USDT you want to buy.\n\n"
+            "💰 BUY USDT\n\n"
+            "Enter how many USDT you want to buy.\n\n"
             "Example:\n"
-            "100\n\n"
-            "Minimum: 1 USDT"
+            "100"
         )
 
-        return ENTER_AMOUNT
+        return 1
 
-    # --------------------------------------------------------
-    # SELL
-    # --------------------------------------------------------
-
-    if data == "SELL":
+    if query.data == "SELL":
 
         context.user_data.clear()
 
         context.user_data["action"] = "SELL"
 
         await query.message.reply_text(
-            "💵 Sell USDT\n\n"
-            "Enter the amount of USDT you want to sell.\n\n"
+            "💵 SELL USDT\n\n"
+            "Enter how many USDT you want to sell.\n\n"
             "Example:\n"
-            "100\n\n"
-            "Minimum: 1 USDT"
+            "100"
         )
 
-        return ENTER_AMOUNT
-
-    # --------------------------------------------------------
-    # RATE
-    # --------------------------------------------------------
-
-    if data == "RATE":
-
-        await query.message.reply_text(
-            f"💱 Current Rate\n\n"
-            f"1 USDT = {format_money(RATE)}"
-        )
-
-        return ConversationHandler.END
-
-    # --------------------------------------------------------
-    # ORDERS
-    # --------------------------------------------------------
-
-    if data == "ORDERS":
-
-        user = update.effective_user
-
-        orders = get_user_orders(user.id)
-
-        if not orders:
-            await query.message.reply_text(
-                "📋 You don't have any orders yet."
-            )
-
-            return ConversationHandler.END
-
-        text = "📋 Your Recent Orders\n\n"
-
-        for order in orders:
-
-            text += (
-                f"🆔 Order #{order['id']}\n"
-                f"Type: {order['action']}\n"
-                f"USDT: {order['usdt_amount']}\n"
-                f"INR: {format_money(order['inr_amount'])}\n"
-                f"Status: {order['status']}\n"
-                f"Date: {order['created_at'][:19]}\n"
-                "--------------------\n"
-            )
-
-        await query.message.reply_text(text)
-
-        return ConversationHandler.END
-
-    # --------------------------------------------------------
-    # ADMIN APPROVE
-    # --------------------------------------------------------
-
-    if data.startswith("APPROVE_"):
-
-        if not is_admin(query.from_user.id):
-
-            await query.message.reply_text(
-                "❌ You are not authorized."
-            )
-
-            return ConversationHandler.END
-
-        order_id = int(data.split("_")[1])
-
-        order = get_order(order_id)
-
-        if not order:
-
-            await query.message.reply_text(
-                "❌ Order not found."
-            )
-
-            return ConversationHandler.END
-
-        update_order_status(order_id, "APPROVED")
-
-        await query.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-        await query.message.reply_text(
-            f"✅ Order #{order_id} approved."
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=order["telegram_id"],
-                text=(
-                    f"✅ Your order #{order_id} has been approved.\n\n"
-                    f"Type: {order['action']}\n"
-                    f"USDT: {order['usdt_amount']}\n"
-                    f"INR: {format_money(order['inr_amount'])}\n\n"
-                    "Please follow the payment instructions provided by the administrator."
-                ),
-            )
-        except Exception as e:
-            logger.error(e)
-
-        return ConversationHandler.END
-
-    # --------------------------------------------------------
-    # ADMIN REJECT
-    # --------------------------------------------------------
-
-    if data.startswith("REJECT_"):
-
-        if not is_admin(query.from_user.id):
-
-            await query.message.reply_text(
-                "❌ You are not authorized."
-            )
-
-            return ConversationHandler.END
-
-        order_id = int(data.split("_")[1])
-
-        order = get_order(order_id)
-
-        if not order:
-
-            await query.message.reply_text(
-                "❌ Order not found."
-            )
-
-            return ConversationHandler.END
-
-        update_order_status(order_id, "REJECTED")
-
-        await query.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-        await query.message.reply_text(
-            f"❌ Order #{order_id} rejected."
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=order["telegram_id"],
-                text=(
-                    f"❌ Your order #{order_id} has been rejected.\n\n"
-                    "Please contact the administrator for more information."
-                ),
-            )
-        except Exception as e:
-            logger.error(e)
-
-        return ConversationHandler.END
+        return 1
 
     return ConversationHandler.END
 
@@ -506,132 +346,113 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 
-async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    text = update.message.text.strip()
+async def amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
-        amount = Decimal(text)
+
+        value = Decimal(
+            update.message.text.strip()
+        )
+
     except InvalidOperation:
 
         await update.message.reply_text(
             "❌ Invalid amount.\n\n"
-            "Please enter a number like:\n"
+            "Enter a number like:\n"
             "10\n"
             "50\n"
             "100.50"
         )
 
-        return ENTER_AMOUNT
+        return 1
 
-    if amount <= 0:
+    if value <= 0:
 
         await update.message.reply_text(
             "❌ Amount must be greater than 0."
         )
 
-        return ENTER_AMOUNT
+        return 1
 
-    if amount < Decimal("1"):
+    if value < Decimal("1"):
 
         await update.message.reply_text(
             "❌ Minimum amount is 1 USDT."
         )
 
-        return ENTER_AMOUNT
+        return 1
 
-    inr_amount = amount * RATE
+    inr = value * RATE
 
-    context.user_data["usdt_amount"] = amount
-    context.user_data["inr_amount"] = inr_amount
+    context.user_data["usdt"] = value
+    context.user_data["inr"] = inr
 
-    action = context.user_data["action"]
-
-    if action == "BUY":
+    if context.user_data["action"] == "BUY":
 
         await update.message.reply_text(
-            f"💰 Buy USDT\n\n"
-            f"USDT Amount: {amount} USDT\n"
+            f"💰 BUY USDT\n\n"
+            f"USDT: {value}\n"
             f"Rate: ₹{RATE}\n"
-            f"Total INR: {format_money(inr_amount)}\n\n"
-            "Now enter your payment information.\n\n"
-            "For example:\n"
-            "UPI ID / Bank details / payment reference"
+            f"Total: ₹{inr:,.2f}\n\n"
+            "Send your payment information."
         )
 
-        return ENTER_PAYMENT
+        return 2
 
     else:
 
         await update.message.reply_text(
-            f"💵 Sell USDT\n\n"
-            f"USDT Amount: {amount} USDT\n"
+            f"💵 SELL USDT\n\n"
+            f"USDT: {value}\n"
             f"Rate: ₹{RATE}\n"
-            f"Total INR: {format_money(inr_amount)}\n\n"
-            "Now enter the USDT wallet address from which the USDT will be sent."
+            f"You receive: ₹{inr:,.2f}\n\n"
+            "Send your USDT wallet address."
         )
 
-        return ENTER_WALLET
+        return 3
 
 
 # ============================================================
-# PAYMENT INFORMATION
+# BUY PAYMENT
 # ============================================================
 
 
-async def payment_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    payment_info = update.message.text.strip()
-
-    context.user_data["payment_info"] = payment_info
+async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
+
+    payment_info = update.message.text.strip()
 
     order_id = create_order(
         telegram_id=user.id,
         username=user.username,
         full_name=user.full_name,
-        action=context.user_data["action"],
-        usdt_amount=context.user_data["usdt_amount"],
-        inr_amount=context.user_data["inr_amount"],
-        rate=RATE,
+        action="BUY",
+        usdt_amount=context.user_data["usdt"],
+        inr_amount=context.user_data["inr"],
         payment_info=payment_info,
     )
 
     await update.message.reply_text(
-        f"✅ Order Created\n\n"
-        f"Order ID: #{order_id}\n"
-        f"Type: {context.user_data['action']}\n"
-        f"USDT: {context.user_data['usdt_amount']}\n"
-        f"Rate: ₹{RATE}\n"
-        f"INR: {format_money(context.user_data['inr_amount'])}\n\n"
-        "Status: ⏳ PENDING\n\n"
-        "The administrator will review your order."
-    )
-
-    # Admin notification
-
-    admin_text = (
-        f"🔔 NEW ORDER\n\n"
-        f"🆔 Order: #{order_id}\n"
-        f"👤 User: {user.full_name}\n"
-        f"🔹 Username: @{user.username if user.username else 'N/A'}\n"
-        f"🔢 Telegram ID: {user.id}\n\n"
-        f"📌 Type: {context.user_data['action']}\n"
-        f"💰 USDT: {context.user_data['usdt_amount']}\n"
-        f"💱 Rate: ₹{RATE}\n"
-        f"💵 INR: {format_money(context.user_data['inr_amount'])}\n\n"
-        f"💳 Payment Information:\n"
-        f"{payment_info}"
+        f"✅ Order #{order_id} created.\n\n"
+        f"USDT: {context.user_data['usdt']}\n"
+        f"Amount: ₹{context.user_data['inr']:,.2f}\n\n"
+        "Status: ⏳ PENDING"
     )
 
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=admin_text,
-        reply_markup=admin_order_keyboard(order_id),
+        ADMIN_ID,
+        (
+            f"🔔 NEW BUY ORDER\n\n"
+            f"Order: #{order_id}\n"
+            f"User: {user.full_name}\n"
+            f"Telegram ID: {user.id}\n"
+            f"Username: @{user.username or 'N/A'}\n\n"
+            f"USDT: {context.user_data['usdt']}\n"
+            f"INR: ₹{context.user_data['inr']:,.2f}\n\n"
+            f"Payment information:\n"
+            f"{payment_info}"
+        ),
     )
 
     context.user_data.clear()
@@ -640,68 +461,46 @@ async def payment_handler(
 
 
 # ============================================================
-# WALLET
+# SELL WALLET
 # ============================================================
 
 
-async def wallet_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    wallet = update.message.text.strip()
-
-    if len(wallet) < 10:
-
-        await update.message.reply_text(
-            "❌ That wallet address looks too short.\n"
-            "Please enter the correct wallet address."
-        )
-
-        return ENTER_WALLET
+async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
+
+    wallet_address = update.message.text.strip()
 
     order_id = create_order(
         telegram_id=user.id,
         username=user.username,
         full_name=user.full_name,
-        action=context.user_data["action"],
-        usdt_amount=context.user_data["usdt_amount"],
-        inr_amount=context.user_data["inr_amount"],
-        rate=RATE,
-        wallet_address=wallet,
+        action="SELL",
+        usdt_amount=context.user_data["usdt"],
+        inr_amount=context.user_data["inr"],
+        wallet_address=wallet_address,
     )
 
     await update.message.reply_text(
-        f"✅ Order Created\n\n"
-        f"Order ID: #{order_id}\n"
-        f"Type: {context.user_data['action']}\n"
-        f"USDT: {context.user_data['usdt_amount']}\n"
-        f"Rate: ₹{RATE}\n"
-        f"INR: {format_money(context.user_data['inr_amount'])}\n\n"
-        "Status: ⏳ PENDING\n\n"
-        "The administrator will review your order."
-    )
-
-    admin_text = (
-        f"🔔 NEW ORDER\n\n"
-        f"🆔 Order: #{order_id}\n"
-        f"👤 User: {user.full_name}\n"
-        f"🔹 Username: @{user.username if user.username else 'N/A'}\n"
-        f"🔢 Telegram ID: {user.id}\n\n"
-        f"📌 Type: {context.user_data['action']}\n"
-        f"💰 USDT: {context.user_data['usdt_amount']}\n"
-        f"💱 Rate: ₹{RATE}\n"
-        f"💵 INR: {format_money(context.user_data['inr_amount'])}\n\n"
-        f"💳 Wallet Address:\n"
-        f"{wallet}"
+        f"✅ Order #{order_id} created.\n\n"
+        f"USDT: {context.user_data['usdt']}\n"
+        f"INR: ₹{context.user_data['inr']:,.2f}\n\n"
+        "Status: ⏳ PENDING"
     )
 
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=admin_text,
-        reply_markup=admin_order_keyboard(order_id),
+        ADMIN_ID,
+        (
+            f"🔔 NEW SELL ORDER\n\n"
+            f"Order: #{order_id}\n"
+            f"User: {user.full_name}\n"
+            f"Telegram ID: {user.id}\n"
+            f"Username: @{user.username or 'N/A'}\n\n"
+            f"USDT: {context.user_data['usdt']}\n"
+            f"INR: ₹{context.user_data['inr']:,.2f}\n\n"
+            f"Wallet:\n"
+            f"{wallet_address}"
+        ),
     )
 
     context.user_data.clear()
@@ -719,144 +518,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     await update.message.reply_text(
-        "❌ Order cancelled.",
-        reply_markup=main_menu(),
+        "❌ Cancelled.\n\n"
+        "Use /start to begin again."
     )
 
     return ConversationHandler.END
 
 
 # ============================================================
-# MY ORDERS COMMAND
+# ERROR
 # ============================================================
 
 
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-
-    orders = get_user_orders(user.id)
-
-    if not orders:
-
-        await update.message.reply_text(
-            "📋 You don't have any orders yet."
-        )
-
-        return
-
-    text = "📋 Your Orders\n\n"
-
-    for order in orders:
-
-        text += (
-            f"🆔 #{order['id']}\n"
-            f"Type: {order['action']}\n"
-            f"USDT: {order['usdt_amount']}\n"
-            f"INR: {format_money(order['inr_amount'])}\n"
-            f"Status: {order['status']}\n"
-            f"Date: {order['created_at'][:19]}\n"
-            "------------------\n"
-        )
-
-    await update.message.reply_text(text)
-
-
-# ============================================================
-# ADMIN ORDERS
-# ============================================================
-
-
-async def admin_orders(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "❌ Unauthorized."
-        )
-
-        return
-
-    conn = get_db()
-
-    orders = conn.execute(
-        """
-        SELECT *
-        FROM orders
-        ORDER BY id DESC
-        LIMIT 20
-        """
-    ).fetchall()
-
-    conn.close()
-
-    if not orders:
-
-        await update.message.reply_text(
-            "No orders found."
-        )
-
-        return
-
-    text = "📊 Recent Orders\n\n"
-
-    for order in orders:
-
-        text += (
-            f"#{order['id']} | "
-            f"{order['action']} | "
-            f"{order['usdt_amount']} USDT | "
-            f"{order['status']}\n"
-        )
-
-    await update.message.reply_text(text)
-
-
-# ============================================================
-# ADMIN RATE
-# ============================================================
-
-
-async def admin_rate(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if not is_admin(user.id):
-
-        await update.message.reply_text(
-            "❌ Unauthorized."
-        )
-
-        return
-
-    await update.message.reply_text(
-        f"Current rate: ₹{RATE} per USDT\n\n"
-        "To change it, update the "
-        "USDT_TO_INR_RATE environment variable "
-        "in Choreo and restart the service."
-    )
-
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def error(update, context):
 
     logger.error(
-        "Exception while handling update:",
+        "Bot error:",
         exc_info=context.error,
     )
 
@@ -868,46 +545,55 @@ async def error_handler(
 
 def main():
 
+    logger.info("Starting bot...")
+
     init_db()
 
+    # Start Choreo health server
+    health_thread = threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    )
+
+    health_thread.start()
+
+    # Create Telegram application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
-    # --------------------------------------------------------
-    # CONVERSATION
-    # --------------------------------------------------------
-
+    # Conversation
     conversation = ConversationHandler(
+
         entry_points=[
             CallbackQueryHandler(
-                button_handler,
+                buttons,
                 pattern="^(BUY|SELL)$",
             )
         ],
 
         states={
 
-            ENTER_AMOUNT: [
+            1: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
-                    amount_handler,
+                    amount,
                 )
             ],
 
-            ENTER_PAYMENT: [
+            2: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
-                    payment_handler,
+                    payment,
                 )
             ],
 
-            ENTER_WALLET: [
+            3: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
-                    wallet_handler,
+                    wallet,
                 )
             ],
         },
@@ -918,42 +604,31 @@ def main():
                 cancel,
             )
         ],
-
-        allow_reentry=True,
     )
 
     application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("orders", my_orders)
-    )
-
-    application.add_handler(
-        CommandHandler("adminorders", admin_orders)
-    )
-
-    application.add_handler(
-        CommandHandler("rate", admin_rate)
-    )
-
-    application.add_handler(conversation)
-
-    application.add_handler(
-        CallbackQueryHandler(
-            button_handler
+        CommandHandler(
+            "start",
+            start,
         )
     )
 
-    application.add_error_handler(
-        error_handler
+    application.add_handler(
+        conversation
     )
 
-    logger.info("Bot started.")
+    application.add_handler(
+        CallbackQueryHandler(
+            buttons
+        )
+    )
+
+    application.add_error_handler(error)
+
+    logger.info("Telegram bot polling started")
 
     application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+        drop_pending_updates=True
     )
 
 
