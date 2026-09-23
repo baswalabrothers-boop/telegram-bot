@@ -24,7 +24,7 @@ from telegram.ext import (
 # ========================
 # CONFIG - USE ENVIRONMENT VARIABLES!
 # ========================
-BOT_TOKEN = os.getenv("8075394934:AAHU9tRE9vemQIDzxRuX4UhxMUtw5mSlMy4")
+BOT_TOKEN = os.getenv("8075394934:AAG4RHb37lUjQYTfPY3DfJZU3ixFV9R7lbM")
 if not BOT_TOKEN:
     raise ValueError("Set BOT_TOKEN in environment variables!")
 
